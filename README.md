@@ -197,28 +197,37 @@ push a single 'select 0' on the queue against self:
 ## FAQ: 
   Q: What dependencies does async need to run?  Will it run on cloud managed
      platforms?
+
   A: Async depends on the dblink module heavily in order to do background 
      processing of queries. In theory, any platform that provides this module 
      should work.  pg_cron is also helpful since it can be used to host the 
      main() process. If this is not available, a client maintained process to
      connect to the database run main() might also be needed.
 
+
   Q: What is the minimum version of postgres async can run on?
+
   A: Async requries postgres 11, which is the version that introduced stored
      procedures.
 
+
   Q: My server ran out of memory? 
+
   A: JIT compilation settings have been known to leak memory in some 
      configurations.  If you are seeing memory leaks leading into a crash, try
      disabling JIT query optimization.
 
+
   Q: Can async run on its own databse or does it have to run on my normal 
      database?
+
   A: Asnyc is designed to run either inside an existing database or on 
      a separate database.  There are obvious benefits to both approaches 
      depending on circumstnaces.
 
+
   Q: How fast is async?  Aren't databases slow?
+
   A: Async ought to be table to faciltiate 100s to 1000s of tasks per second,
      perhaps into the 10s of thousands with good hardware.  It is not designed
      to be a zero latency messaging queue or scale to millions of concurrent 
@@ -228,9 +237,11 @@ push a single 'select 0' on the queue against self:
      will not need a lot of storage or memory unless a long task history is 
      kept.
 
+
   Q: Why build a query processing queue in a database? Is this sorcery? Are you 
      insane? Why not use an established orchesrtation engine such as airflow 
      instead?
+
   A: Orchestating postgres queries from postgres itself leads to simplicity and
      allows for deep exploitation of database mechanics.  Databases are highly
      concurrent engines that simplify some of the most important aspects of 
@@ -241,7 +252,9 @@ push a single 'select 0' on the queue against self:
      of having the state machine and the log be the same data stucture is very 
      subtle but powerful once realized.
 
+
   Q: Why not package async as an extension?
+
   A: Postgres extensions have a major downside in that the presume the server
      is running on a platform with direct filesystem access.  In practical 
      terms, this makes extensions unsuitable for cloud hosted platforms such as
