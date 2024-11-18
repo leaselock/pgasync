@@ -1,3 +1,5 @@
+# pgasync: Run postgresql commands in background through dblink
+
 "Async" is a postgres extension which allows placing queries on a processing 
 queue for deferrred execution.  This is useful for pushing work into the 
 background in a way that can be easily threaded.  This is useful for batch 
@@ -7,10 +9,20 @@ Async is an all SQL library, and has no required dependencies other than dblink
 which comes pacakged with the database.  This makes deployment very simple and 
 portable across many runtime environments such as cloud computing.
 
+## Features:
+  * Run queries in background either on hosting database or any database
+  Minimial dependencies, can run in cloud SQL platforms or any platform
+  that can run dblink
+
+
+## Concepts
+
 Async defines the following concepts:
   * server: a database that contains configuration data and housekeeping 
     information around runninng tasks.  This can be a standalone database
     or installed to coexist within an existing database
+  * orchestrator: the process running inside the server that launches tasks
+    tracks their execution.    
   * async.main(): a stored procedure which starts up and never terminates
     (excepting unusual errors and other edge cases. 
   * target: a postgres database that runs tasks
@@ -20,6 +32,10 @@ Async defines the following concepts:
     resolve completion with the invoking query.
 
 Installing the async library:
+  * Installation can be managed inside or outside of the pgdeploy intsallation
+    framework. In either scenario, async.sql must be deployed in the database
+    first.  If the database is additionally to be configured as a server,
+    async_server.sql must also be deployed. 
 
 Starting the orchestrator process:
   The ochestrator process is called via: CALL async.main(<force>).   This 
@@ -42,7 +58,7 @@ Configuring the library:
     "concurrency_pools": [<pool>, ]
   }
 
-The "Contol" object is optional.  Individual elements of the object are also 
+The "Control" object is optional.  Individual elements of the object are also 
 optional as all options are defaulted.  The following values can be configured:
 
   * workers INT DEFAULT 20:  how many tasks can be held open concurrently 
@@ -105,7 +121,7 @@ Concurrency pool:
 
 
 
-Running tasks
+## Running tasks
 
 * Tasks can be pushed to the orchestrator via:
 
@@ -176,7 +192,7 @@ FROM
 
 
 
-FAQ: 
+## FAQ: 
   Q: What dependencies does async need to run?  Will it run on cloud managed
      platforms?
   A: Async depends on the dblink module heavily in order to do background 
