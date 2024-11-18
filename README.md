@@ -31,13 +31,13 @@ Async defines the following concepts:
   * asynchronous tasks:  tasks that call back to report task completion rather
     resolve completion with the invoking query.
 
-Installing the async library:
+## Installing the async library:
   * Installation can be managed inside or outside of the pgdeploy intsallation
     framework. In either scenario, async.sql must be deployed in the database
     first.  If the database is additionally to be configured as a server,
     async_server.sql must also be deployed. 
 
-Starting the orchestrator process:
+## Starting the orchestrator process:
   The ochestrator process is called via: CALL async.main(<force>).   This 
   process will start and never terminate unless cancelled or an error occurs.
   If async.main() returns immediately, it means that the orchestrator process
@@ -47,11 +47,13 @@ Starting the orchestrator process:
   and take over so that *it* can become th orchestratior.
 
 
-Updating the async library: TBD
+## Updating the async library: TBD
 
-Configuring the library:
-  Async is configured in JSONB via async.configure().  The configuration 
-  has the following structure:
+## Configuring the library:
+
+Async is configured in JSONB via async.configure().  The configuration 
+has the following structure:
+    
     {
       "control": <control>,
       "targets": [<target>, ...],
@@ -96,6 +98,7 @@ optional as all options are defaulted.  The following values can be configured:
 
 Target: At least one target must be defined. A target object allows for the following 
 configuration;
+
   * target TEXT (Required): the name of the target.
 
   * connection_string TEXT (required): the connection string used to connect to
@@ -123,7 +126,7 @@ Concurrency pool:
 
 ## Running tasks
 
-* Tasks can be pushed to the orchestrator via:
+Tasks can be pushed to the orchestrator via:
 
     CREATE OR REPLACE FUNCTION async.push_tasks(
       _tasks async.task_push_t[],
@@ -152,8 +155,8 @@ task_push_t is defined as:
                                           rather than the target.
     )
 
-  The helper function, async.task() simplifies creation of task_push_t by
-  making use of optional arguments:
+The helper function, async.task() simplifies creation of task_push_t by
+making use of optional arguments:
 
     CREATE OR REPLACE FUNCTION async.task(
       _query TEXT,
@@ -175,7 +178,7 @@ _run_type: allows fo the following:
 _source: An arbitrary text field to allow the caller to record who/what 
          initiated the task.
 
-* Examples:
+## Examples:
 
 push a single 'select 0' on the queue against self:
 
@@ -189,8 +192,6 @@ push a single 'select 0' on the queue against self:
       SELECT async.task('select 0', 'SELF') 
       FROM generate_series(1,1000)
     ) q;
-
-
 
 
 ## FAQ: 
