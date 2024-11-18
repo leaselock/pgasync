@@ -52,11 +52,11 @@ Updating the async library: TBD
 Configuring the library:
   Async is configured in JSONB via async.configure().  The configuration 
   has the following structure:
-  {
-    "control": <control>,
-    "targets": [<target>, ...],
-    "concurrency_pools": [<pool>, ]
-  }
+    {
+      "control": <control>,
+      "targets": [<target>, ...],
+      "concurrency_pools": [<pool>, ]
+    }
 
 The "Control" object is optional.  Individual elements of the object are also 
 optional as all options are defaulted.  The following values can be configured:
@@ -125,69 +125,70 @@ Concurrency pool:
 
 * Tasks can be pushed to the orchestrator via:
 
-CREATE OR REPLACE FUNCTION async.push_tasks(
-  _tasks async.task_push_t[],
-  _run_type async.task_run_type_t DEFAULT 'EXECUTE',
-  _source TEXT DEFAULT NULL) RETURNS SETOF async.task AS
+    CREATE OR REPLACE FUNCTION async.push_tasks(
+      _tasks async.task_push_t[],
+      _run_type async.task_run_type_t DEFAULT 'EXECUTE',
+      _source TEXT DEFAULT NULL) RETURNS SETOF async.task AS ...
 
 _tasks: an array of task_push_t. task_push_t offers the following record 
         to define each task sent.  Each record of the array will be a specific 
         task.
 
-  task_push_t:
-  (
-    task_data JSONB DEFAULT NULL: an object to carry extra data with the task
+task_push_t is defined as:
 
-    target TEXT (Required): the target the orchestator will connect to and run
-                            the task against.
+    (
+      task_data JSONB DEFAULT NULL: an object to carry extra data with the task
 
-    priority INT DEFAULT 0: Tasks with a lower priority will always run before
-                            tasks with a higher priority.  Priority < 0 is 
-                            reserved for the orchestrator itself.
+      target TEXT (Required): the target the orchestator will connect to and run
+                              the task against.
 
-    query TEXT (Required): The query (task) to run
+      priority INT DEFAULT 0: Tasks with a lower priority will always run before
+                              tasks with a higher priority.  Priority < 0 is 
+                              reserved for the orchestrator itself.
 
-    concurrency_pool TEXT DEFUALT NULL: Use this pool to throttle task execution
-                                        rather than the target.
-  )
+      query TEXT (Required): The query (task) to run
+
+      concurrency_pool TEXT DEFUALT NULL: Use this pool to throttle task execution
+                                          rather than the target.
+    )
 
   The helper function, async.task() simplifies creation of task_push_t by
   making use of optional arguments:
 
-CREATE OR REPLACE FUNCTION async.task(
-  _query TEXT,
-  target TEXT,
-  task_data JSONB DEFAULT NULL,
-  priority INT DEFAULT 0,
-  concurrency_pool TEXT DEFAULT NULL) RETURNS async.task_push_t AS  
-
-
+    CREATE OR REPLACE FUNCTION async.task(
+      _query TEXT,
+      target TEXT,
+      task_data JSONB DEFAULT NULL,
+      priority INT DEFAULT 0,
+      concurrency_pool TEXT DEFAULT NULL) RETURNS async.task_push_t AS  
 
 _run_type: allows fo the following:
 
-  'EXECUTE':         run task normally
+    'EXECUTE':         run task normally
 
-  'DOA':             place task into queue dead ('Dead On Arrival') not useful 
-                     except when extending the library.  
+    'DOA':             place task into queue dead ('Dead On Arrival') not useful 
+                       except when extending the library.  
          
-  'EXECUTE_NOASYNC': run task, but do not set complete when it is invoked.
-                     this basically overrides the target flag.
+    'EXECUTE_NOASYNC': run task, but do not set complete when it is invoked.
+                       this basically overrides the target flag.
 
 _source: An arbitrary text field to allow the caller to record who/what 
          initiated the task.
 
 * Examples:
 
-/* push a single 'select 0' on the queue against self */
-SELECT async.push_tasks(array[async.task('select 0', 'SELF')]);
+push a single 'select 0' on the queue against self:
 
-/* push a 1000 'select 0' queries on the queue against self */
-SELECT async.push_tasks(array_agg(t))
-FROM
-( 
-  SELECT async.task('select 0', 'SELF') 
-  FROM generate_series(1,1000)
-) q;
+    SELECT async.push_tasks(array[async.task('select 0', 'SELF')]);
+
+ push a 1000 'select 0' queries on the queue against self:
+
+    SELECT async.push_tasks(array_agg(t))
+    FROM
+    ( 
+      SELECT async.task('select 0', 'SELF') 
+      FROM generate_series(1,1000)
+    ) q;
 
 
 
