@@ -727,9 +727,10 @@ $$ LANGUAGE PLPGSQL;
 
 
 
-CREATE OR REPLACE FUNCTION async.acquire_mutex(
+CREATE OR REPLACE PROCEDURE async.acquire_mutex(
   _lock_id INT,
-  _force BOOL DEFAULT FALSE) RETURNS BOOL AS
+  _force BOOL DEFAULT FALSE,
+  acquired INOUT BOOL DEFAULT FALSE) AS
 $$
 DECLARE
   _acquired BOOL;
@@ -739,8 +740,13 @@ BEGIN
   THEN
     IF NOT _force 
     THEN
-      RETURN false;
+      acquired := false;
+      RETURN;
     END IF;
+
+    /* force enabled flag false to kindly ask other process to halt */
+    UPDATE async.control SET enabled = false;
+    COMMIT;
 
     SELECT INTO _pid pid FROM pg_locks 
     WHERE 
@@ -757,7 +763,7 @@ BEGIN
 
     IF _pid IS DISTINCT FROM (SELECT pid FROM async.control)
     THEN
-      RAISE EXCEPTION 'Lock owning pid % does not match expected pid %',
+      RAISE WARNING 'Lock owning pid % does not match expected pid %',
         _pid, (SELECT pid FROM async.control);
     END IF;
 
@@ -766,25 +772,29 @@ BEGIN
 
     FOR x IN 1..5
     LOOP
-      _acquired := pg_try_advisory_lock(0);
+      acquired := pg_try_advisory_lock(0);
 
-      IF _acquired 
+      IF acquired 
       THEN
+        /* force enabled flag false to kindly ask other process to halt */
+        UPDATE async.control SET enabled = true;
+
         RAISE NOTICE 'Lock forcefully acquired';
-        RETURN true;
+        acquired := true;
+        RETURN;
       END IF;
 
       RAISE NOTICE 'Waiting on pid % to release lock', _pid;
       PERFORM pg_sleep(1.0);
     END LOOP;
 
-    IF NOT _acquired
+    IF NOT acquired
     THEN
       RAISE EXCEPTION 'Unable to acquire lock...try again later?';
     END IF;
   END IF;
 
-  RETURN true;
+  acquired := true;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -799,10 +809,20 @@ DECLARE
 
   _last_did_stuff TIMESTAMPTZ;
   _back_off INTERVAL DEFAULT '30 seconds';
+
+  _acquired BOOL;
 BEGIN
   SELECT INTO g * FROM async.control;
 
-  IF NOT async.acquire_mutex(g.advisory_mutex_id, _force)
+  /* yeet! */
+  IF NOT g.enabled AND NOT _force
+  THEN
+    RETURN;
+  END IF;
+
+  CALL async.acquire_mutex(g.advisory_mutex_id, _force, _acquired);
+
+  IF NOT _acquired
   THEN
     RETURN;
   END IF;
@@ -858,6 +878,11 @@ BEGIN
       _show_message := true;
       _last_did_stuff := clock_timestamp();
     ELSE
+      IF NOT (SELECT enabled FROM async.control)
+      THEN
+        RETURN;
+      END IF;    
+
       /* wait a little bit before showing message, and be aggressive */      
       IF _show_message 
       THEN
