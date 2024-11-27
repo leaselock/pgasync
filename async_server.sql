@@ -70,7 +70,10 @@ CREATE TABLE async.task
   times_up TIMESTAMPTZ,
   task_data JSONB,  /* opaque to hold arbitrary data */
 
-  concurrency_pool TEXT
+  concurrency_pool TEXT,
+
+  /* alterate processing time for concurrency tracking purposes */
+  concurrency_processed TIMESTAMPTZ
 );
 
 /* supports fetching eligible tasks */
@@ -613,7 +616,8 @@ BEGIN
     processing_error = NULLIF(_error_message, 'OK'),
     /* pause state is special; move task back into unprocessed state */
     consumed = CASE WHEN _status != 'PAUSED' THEN consumed END,
-    finish_status = NULLIF(_status, 'PAUSED')
+    finish_status = NULLIF(_status, 'PAUSED'),
+    concurrency_processed = coalesce(concurrency_processed, now())
   WHERE task_id = ANY(_task_ids);
 
   UPDATE async.concurrency_pool_tracker p SET 
@@ -627,11 +631,11 @@ BEGIN
     WHERE 
       task_id = ANY(_task_ids)
       AND concurrency_pool IS NOT NULL
-      AND processed IS NOT NULL
       AND consumed IS NOT NULL
       AND concurrency_pool != (SELECT self_target FROM async.control)
       AND _status != 'DOA'
       AND source != 'run deferred task'
+      AND concurrency_processed = now()
     GROUP BY 1
   ) q
   WHERE p.concurrency_pool = q.concurrency_pool;
