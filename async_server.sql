@@ -616,8 +616,7 @@ BEGIN
     processing_error = NULLIF(_error_message, 'OK'),
     /* pause state is special; move task back into unprocessed state */
     consumed = CASE WHEN _status != 'PAUSED' THEN consumed END,
-    finish_status = NULLIF(_status, 'PAUSED'),
-    concurrency_processed = coalesce(concurrency_processed, now())
+    finish_status = NULLIF(_status, 'PAUSED')
   WHERE task_id = ANY(_task_ids);
 
   UPDATE async.concurrency_pool_tracker p SET 
@@ -635,7 +634,11 @@ BEGIN
       AND concurrency_pool != (SELECT self_target FROM async.control)
       AND _status != 'DOA'
       AND source != 'run deferred task'
-      AND concurrency_processed = now()
+      AND 
+      (
+        concurrency_processed = now()
+        OR (processed IS NOT NULL AND concurrency_processed IS NULL)
+      ) 
     GROUP BY 1
   ) q
   WHERE p.concurrency_pool = q.concurrency_pool;
@@ -907,5 +910,34 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+
+CREATE OR REPLACE VIEW async.v_target_status AS
+  SELECT 
+    target,
+    COUNT(*) AS tasks_entered_24h,
+    COUNT(*) FILTER(WHERE entered >= now() - '1 hour'::INTERVAL) 
+      AS tasks_entered_1h,
+    COUNT(*) FILTER(WHERE entered >= now() - '1 minute'::INTERVAL) 
+      AS tasks_entered_1m,    
+    COUNT(*) FILTER (WHERE consumed IS NULL AND processed IS NULL) AS tasks_pending,
+    COUNT(*) FILTER (WHERE processed IS NULL AND yielded IS NULL) AS tasks_running,
+    COUNT(*) FILTER (WHERE processed IS NULL AND yielded IS NOT NULL) AS tasks_yielded,
+    COALESCE(cpt.workers, 0) AS concurency_assigned_workers,
+    COUNT(*) FILTER (
+        WHERE 
+          consumed IS NOT NULL 
+          AND processed IS NULL
+          AND t.concurrency_pool IS DISTINCT FROM t.target) 
+      AS concurrency_external_pool,
+    COALESCE(cp.max_workers, target.max_concurrency) AS concurency_max_workers
+  FROM async.target
+  LEFT JOIN async.task t USING(target)
+  LEFT JOIN async.concurrency_pool cp ON 
+    target.target = cp.concurrency_pool
+  LEFT JOIN async.concurrency_pool_tracker cpt ON 
+    cp.concurrency_pool = cpt.concurrency_pool
+  WHERE entered >= now() - '1 day'::INTERVAL
+  GROUP BY target, cp.concurrency_pool, cpt.concurrency_pool
+  ORDER BY target;
 
 
