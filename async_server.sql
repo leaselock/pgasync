@@ -38,7 +38,8 @@ CREATE TABLE async.target
   target TEXT PRIMARY KEY,
   max_concurrency INT DEFAULT 8,
   connection_string TEXT,
-  asynchronous_finish BOOL DEFAULT false
+  asynchronous_finish BOOL DEFAULT false,
+  default_timeout INTERVAL
 );
 
 
@@ -82,6 +83,11 @@ WHERE
   consumed IS NULL
   AND yielded IS NULL
   AND processed IS NULL;
+
+CREATE INDEX ON async.task(times_up)
+  WHERE 
+    processed IS NULL
+    AND times_up IS NOT NULL;
 
 
 CREATE UNLOGGED TABLE async.worker
@@ -198,6 +204,7 @@ SELECT * FROM
       SELECT 
         t.*,
         tg.connection_string,
+        tg.default_timeout,
         pt.max_workers,
         pt.workers      
       FROM async.task t
@@ -314,12 +321,15 @@ $$
 DECLARE
   r async.v_candidate_task;
   w RECORD;
+  c async.control;
 BEGIN 
   did_stuff := false;
 
+  SELECT INTO c * FROM async.control;
+
   FOR r IN SELECT * FROM async.v_candidate_task
   LOOP
-    IF r.target = (SELECT self_target FROM async.control)
+    IF r.target = c.self_target
     THEN
       /* logging async deferrals pollutes log */
       IF r.source != 'finish_async'
@@ -385,7 +395,9 @@ BEGIN
         running_since = clock_timestamp()
       WHERE slot = w.slot;
 
-      UPDATE async.task SET consumed = clock_timestamp()
+      UPDATE async.task SET 
+        consumed = clock_timestamp(),
+        times_up = now() + COALESCE(r.default_timeout, c.default_timeout)
       WHERE task_id = r.task_id;
 
       RAISE NOTICE 'Running task id % pool % slot: % % %[action %]', 
@@ -658,6 +670,18 @@ DECLARE
   _error_message TEXT;
   _failed BOOL;
 BEGIN
+  PERFORM async.finish_internal(
+    array_agg(task_id),
+    'FAILED'::async.finish_status_t,
+    'time out tasks',
+    'Canceling due to time out')
+  FROM async.task t
+  WHERE 
+    processed IS NULL
+    /* making extra extra sure partial index is utilized */
+    AND times_up IS NOT NULL
+    AND times_up < now();
+
   FOR r IN 
     SELECT 
       w.name,
@@ -710,6 +734,8 @@ $$
 DECLARE
   g async.control;  
 BEGIN 
+  RAISE NOTICE 'Heavy maintenance';
+
   SELECT INTO g * FROM async.control;
 
   DELETE FROM async.task 
@@ -839,20 +865,12 @@ BEGIN
 
   /* dragons live forever, but not so little boys */
   SET statement_timeout = 0;
-
-  /* attempt to acquire process lock */
-  RAISE NOTICE 'Heavy heavy_maintenance';
-
+  
   /* run heavy maitenance now as a precaution */
   PERFORM async.heavy_maintenance();
 
   /* attempt to acquire process lock */
   RAISE NOTICE 'Initializing workers';
-
-  /* reset worker table with a startup flag here so that the initialization to 
-   * extend at runtime if needed.
-   */
-  PERFORM async.initialize_workers(g, true);
 
   /* attempt to acquire process lock */
   RAISE NOTICE 'Cleaning up unfinished tasks (if any)';
@@ -865,6 +883,11 @@ BEGIN
   WHERE 
     consumed IS NOT NULL
     AND processed IS NULL;
+
+  /* reset worker table with a startup flag here so that the initialization to 
+   * extend at runtime if needed.
+   */
+  PERFORM async.initialize_workers(g, true);    
 
   UPDATE async.control SET 
     pid = pg_backend_pid(),
