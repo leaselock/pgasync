@@ -1,7 +1,7 @@
 /* Standard routines and structures for asynchronous processing.   Intended
- * to be standalone module (hence calls to RAISE NOTICE vs log()).  More or less
- * a glorified wrapper to dblink(), but facilitates background query processing
- * to arbitrary targets.
+ * to be standalone module.  More or less a glorified wrapper to dblink(), 
+ * but facilitates background query processing to arbitrary targets.
+ * 
  */
 
 \if :bootstrap
@@ -114,10 +114,61 @@ CREATE UNLOGGED TABLE async.concurrency_pool_tracker
   max_workers INT DEFAULT 8
 );
 
+CREATE TABLE async.server_log
+(
+  server_log BIGSERIAL PRIMARY KEY,
+  happened TIMESTAMPTZ,
+  level TEXT,
+  message TEXT
+);
+
+CREATE INDEX ON async.server_log(happened);
+
 
 -- SELECT cron.schedule('api processor daemon', '* * * * *', 'CALL main()');
 
 \endif
+
+CREATE OR REPLACE FUNCTION async.log(
+  _level TEXT,
+  _message TEXT) RETURNS VOID AS
+$$
+BEGIN
+  IF _level = 'NOTICE'
+  THEN 
+    RAISE NOTICE '%', _message;
+  ELSEIF _level = 'WARNING'
+  THEN
+    RAISE WARNING '%', _message;
+   ELSEIF _level = 'DEBUG'
+  THEN
+    RAISE WARNING '%', _message;
+  ELSE
+    PERFORM dblink_exec(
+      (SELECT self_connection_string FROM async.control),
+      format(
+        'INSERT INTO async.server_log(level, message) VALUES (%s, %s)',
+        quote_literal(_level),
+        quote_literal(_message)));
+
+    RAISE EXCEPTION '%', _message;
+  END IF;
+
+  INSERT INTO async.server_log(level, message) VALUES (_level, _message);
+END;
+$$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION async.log(
+  _message TEXT) RETURNS VOID AS
+$$
+BEGIN
+  PERFORM async.log('NOTICE', _message);
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+
+
 
 
 CREATE OR REPLACE VIEW async.v_target AS 
@@ -447,41 +498,42 @@ $$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE FUNCTION async.check_task_ids(
   _task_ids BIGINT[],
-  _context TEXT) RETURNS VOID AS
+  _context TEXT) RETURNS BIGINT[] AS
 $$
 DECLARE
-  _bad_task_ids BIGINT[];
+  _missing_task_ids BIGINT[];
+  _duplicate_task_ids BIGINT[];
+  _eligible_task_ids BIGINT[];
 BEGIN
-  SELECT INTO _bad_task_ids array_agg(t)
-  FROM unnest(_task_ids) t
-  WHERE 
-    NOT EXISTS (
-      SELECT 1 FROM async.task t2
-      WHERE t2.task_id = t
-    );
+  SELECT INTO _missing_task_ids, _duplicate_task_ids, _eligible_task_ids
+    array_agg(t.task_id) FILTER(WHERE t2.task_id IS NULL),
+    array_agg(t.task_id) FILTER(
+      WHERE t2.task_id IS NOT NULL AND processed IS NOT NULL),
+    array_agg(t.task_id) FILTER(
+      WHERE t2.task_id IS NOT NULL AND processed IS NULL)    
+  FROM 
+  (
+    SELECT unnest(_task_ids) task_id
+  ) t
+  LEFT JOIN async.task t2 ON
+    t.task_id = t2.task_id;
 
-  IF array_upper(_bad_task_ids, 1) > 0
+  IF array_upper(_missing_task_ids, 1) > 0
   THEN
     RAISE EXCEPTION 'Attempted action on bad task_ids % for %', 
       _bad_task_ids,
       _context;
   END IF;
 
-  SELECT INTO _bad_task_ids array_agg(t)
-  FROM unnest(_task_ids) t
-  WHERE EXISTS (
-      SELECT 1 FROM async.task t2
-      WHERE 
-        t2.task_id = t
-        AND t2.processed IS NOT NULL
-    );
 
-  IF array_upper(_bad_task_ids, 1) > 0
+  IF array_upper(_duplicate_task_ids, 1) > 0
   THEN
-    RAISE EXCEPTION 'Attempted action on already finished task_ids % for %', 
+    RAISE WARNING 'Attempted action on already finished task_ids % for %', 
       _bad_task_ids,
       _context;
   END IF;
+
+  RETURN _eligible_task_ids;
 
 END;
 $$ LANGUAGE PLPGSQL;
@@ -745,6 +797,9 @@ BEGIN
 
   DELETE FROM async.task 
   WHERE processed < clock_timestamp() - g.task_keep_duration;
+
+  DELETE FROM async.server_log 
+  WHERE happened < clock_timestamp() - g.task_keep_duration;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -794,18 +849,22 @@ BEGIN
 
     IF _pid IS NULL
     THEN
-      /* ???? */
-      RAISE EXCEPTION 
-        'Unable to acquire lock with no controlling pid...try again?';
+      PERFORM async.log(
+        'ERROR', 
+        'Unable to acquire lock with no controlling pid...try again?');
     END IF;
 
     IF _pid IS DISTINCT FROM (SELECT pid FROM async.control)
     THEN
-      RAISE WARNING 'Lock owning pid % does not match expected pid %',
-        _pid, (SELECT pid FROM async.control);
+      PERFORM async.log(
+        'WARNING',
+        format(
+          'Lock owning pid %s does not match expected pid %s',
+          _pid,
+          (SELECT pid FROM async.control)));
     END IF;
 
-    RAISE NOTICE 'Force acquiring over main process %', _pid;
+    PERFORM async.log(format('Force acquiring over main process %s', _pid));
     PERFORM pg_terminate_backend(_pid);
 
     FOR x IN 1..5
@@ -817,18 +876,18 @@ BEGIN
         /* force enabled flag false to kindly ask other process to halt */
         UPDATE async.control SET enabled = true;
 
-        RAISE NOTICE 'Lock forcefully acquired';
+        PERFORM async.log('Lock forcefully acquired');
         acquired := true;
         RETURN;
       END IF;
 
-      RAISE NOTICE 'Waiting on pid % to release lock', _pid;
+      PERFORM async.log(format('Waiting on pid %s to release lock', _pid));
       PERFORM pg_sleep(1.0);
     END LOOP;
 
     IF NOT acquired
     THEN
-      RAISE EXCEPTION 'Unable to acquire lock...try again later?';
+      PERFORM async.log('ERROR', 'Unable to acquire lock...try again later?');
     END IF;
   END IF;
 
@@ -866,7 +925,7 @@ BEGIN
   END IF;
 
   /* attempt to acquire process lock */
-  RAISE NOTICE 'Initializing asynchronous query processor';
+  PERFORM async.log('Initializing asynchronous query processor');
 
   /* dragons live forever, but not so little boys */
   SET statement_timeout = 0;
@@ -875,16 +934,16 @@ BEGIN
   PERFORM async.heavy_maintenance();
 
   /* attempt to acquire process lock */
-  RAISE NOTICE 'Initializing workers';
+  PERFORM async.log('Initializing workers');
 
   /* attempt to acquire process lock */
-  RAISE NOTICE 'Cleaning up unfinished tasks (if any)';
+  PERFORM async.log('Cleaning up unfinished tasks (if any)');
 
   /* clear out any tasks that may have been left in running state */
   UPDATE async.task SET 
     processed = now(),
     failed = true,
-    processing_error = 'ERROR: presumed failed due to async startup'
+    processing_error = 'presumed failed due to async startup'
   WHERE 
     consumed IS NOT NULL
     AND processed IS NULL;
@@ -898,7 +957,7 @@ BEGIN
     pid = pg_backend_pid(),
     running_since = clock_timestamp();
 
-  RAISE NOTICE 'Initialization of query processor complete.';    
+  PERFORM async.log('Initialization of query processor complete');    
   LOOP
     IF NOT g.Paused
     THEN
@@ -925,10 +984,10 @@ BEGIN
           OR _last_did_stuff IS NULL
         THEN
           _show_message := false;  
-          RAISE NOTICE 'Nothing to do. sleeping';
+          PERFORM async.log('Nothing to do. sleeping');
         END IF;
 
-        PERFORM pg_sleep(0.000001);
+        PERFORM pg_sleep(0.1);
       ELSE
         PERFORM pg_sleep(g.idle_sleep);  
       END IF;

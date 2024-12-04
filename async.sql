@@ -165,7 +165,7 @@ BEGIN
     RETURN;
   END IF; 
 
-  PERFORM async.check_task_ids(_task_ids, 'finish_async');
+  _task_ids := async.check_task_ids(_task_ids, 'finish_async');
 
   /* is this a foreground request? If so, convert to task */
   IF pg_backend_pid() = (SELECT pid FROM async.control) 
