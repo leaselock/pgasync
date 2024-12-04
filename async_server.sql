@@ -219,7 +219,7 @@ SELECT * FROM
       LIMIT (SELECT g.workers * 2 FROM async.control g)
     ) q
   ) q
-  WHERE n <= COALESCE(max_workers - workers, 8)
+  WHERE n <= COALESCE(max_workers - workers, 4)
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
 
@@ -418,7 +418,7 @@ BEGIN
       SELECT
         r.concurrency_pool,
         1,
-        COALESCE(cp.max_workers, 8)
+        COALESCE(cp.max_workers, 4)
       FROM
       (
         SELECT r.concurrency_pool
@@ -671,16 +671,21 @@ DECLARE
   _failed BOOL;
 BEGIN
   PERFORM async.finish_internal(
-    array_agg(task_id),
+    tasks,
     'FAILED'::async.finish_status_t,
     'time out tasks',
     'Canceling due to time out')
-  FROM async.task t
-  WHERE 
-    processed IS NULL
-    /* making extra extra sure partial index is utilized */
-    AND times_up IS NOT NULL
-    AND times_up < now();
+  FROM
+  (
+    SELECT array_agg(task_id) AS tasks
+    FROM async.task t
+    WHERE 
+      processed IS NULL
+      /* making extra extra sure partial index is utilized */
+      AND times_up IS NOT NULL
+      AND times_up < now()
+  )
+  WHERE array_upper(tasks, 1) >= 1;
 
   FOR r IN 
     SELECT 
