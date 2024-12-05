@@ -117,7 +117,7 @@ CREATE UNLOGGED TABLE async.concurrency_pool_tracker
 CREATE TABLE async.server_log
 (
   server_log BIGSERIAL PRIMARY KEY,
-  happened TIMESTAMPTZ,
+  happened TIMESTAMPTZ DEFAULT clock_timestamp(),
   level TEXT,
   message TEXT
 );
@@ -165,9 +165,6 @@ BEGIN
   PERFORM async.log('NOTICE', _message);
 END;
 $$ LANGUAGE PLPGSQL;
-
-
-
 
 
 
@@ -280,12 +277,14 @@ CREATE OR REPLACE FUNCTION async.disconnect(
   _reason TEXT) RETURNS VOID AS
 $$
 BEGIN
-  RAISE NOTICE 'Disconnecting worker % via %', _name, _reason;
-
+  PERFORM async.log(format('Disconnecting worker %s via %s', _name, _reason));
+  
   BEGIN
     PERFORM dblink_disconnect(_name);
   EXCEPTION WHEN OTHERS THEN 
-    RAISE WARNING 'Got % during connection disconnect', SQLERRM;
+    PERFORM async.log(
+      'WARNING', 
+      format('Got %s during connection disconnect', SQLERRM));
   END;
 
   UPDATE async.worker w SET 
@@ -342,6 +341,7 @@ $$
 DECLARE
   _failed BOOL;
   _error_message TEXT;
+  _context TEXT;
 BEGIN
   UPDATE async.task SET consumed = clock_timestamp()
   WHERE task_id = _task_id;
@@ -350,7 +350,9 @@ BEGIN
     EXECUTE _query;
   EXCEPTION WHEN OTHERS THEN
     _failed := true;
-    _error_message := SQLERRM;
+
+    GET STACKED DIAGNOSTICS _context = pg_exception_context;
+    _error_message := format(E'%s\ncontext: %s', SQLERRM, _context);
   END;
 
   PERFORM async.finish_internal(
@@ -385,7 +387,9 @@ BEGIN
       /* logging async deferrals pollutes log */
       IF r.source != 'finish_async'
       THEN
-        RAISE NOTICE 'Running deferred task id % via %', r.task_id, r.source;
+        PERFORM async.log(
+          format('Running deferred task id %s via %s', r.task_id, r.source));
+
       END IF;
 
       did_stuff := async.run_deferred_task(r.task_id, r.query);
@@ -417,8 +421,12 @@ BEGIN
         BEGIN
           PERFORM * FROM dblink(w.name, 'SELECT 0') AS R(v INT);
         EXCEPTION WHEN OTHERS THEN
-          RAISE WARNING 'Got % when attempting to recycle connection %', 
-            SQLERRM, to_json(w);
+          PERFORM async.log(
+            'WARNING',
+            format('Got %s when attempting to recycle connection %s', 
+              SQLERRM, 
+              to_json(w)));
+
             w.connect_action := 'reconnect';
         END;
       END IF;
@@ -451,16 +459,18 @@ BEGIN
         times_up = now() + COALESCE(r.default_timeout, c.default_timeout)
       WHERE task_id = r.task_id;
 
-      RAISE NOTICE 'Running task id % pool % slot: % % %[action %]', 
-        r.task_id, 
-        r.concurrency_pool,
-        w.slot,
-        COALESCE('data: "' || r.task_data::TEXT || '" ', ''),
-        CASE WHEN r.source IS NOT NULL
-          THEN format('via %s ',  r.source)
-          ELSE ''
-        END,
-        w.connect_action;
+      PERFORM async.log(
+        format(
+          'Running task id %s pool %s slot: %s %s %s[action %s]', 
+          r.task_id, 
+          r.concurrency_pool,
+          w.slot,
+          COALESCE('data: "' || r.task_data::TEXT || '" ', ''),
+          CASE WHEN r.source IS NOT NULL
+            THEN format('via %s ',  r.source)
+            ELSE ''
+          END,
+          w.connect_action));
 
       INSERT INTO async.concurrency_pool_tracker(
         concurrency_pool,
@@ -479,7 +489,9 @@ BEGIN
         workers = concurrency_pool_tracker.workers + 1;
 
     EXCEPTION WHEN OTHERS THEN
-      RAISE NOTICE 'Got % when attempting to run task', SQLERRM;
+      PERFORM async.log(
+        'WARNING',
+        format('Got %s when attempting to run task', SQLERRM));
 
       UPDATE async.task SET 
         consumed = clock_timestamp(),
@@ -520,17 +532,23 @@ BEGIN
 
   IF array_upper(_missing_task_ids, 1) > 0
   THEN
-    RAISE EXCEPTION 'Attempted action on bad task_ids % for %', 
-      _bad_task_ids,
-      _context;
+    PERFORM async.log(
+      'WARNING',
+      format(
+        'Attempted action on bad task_ids %s for %s', 
+        _bad_task_ids,
+        _context));
   END IF;
 
 
   IF array_upper(_duplicate_task_ids, 1) > 0
   THEN
-    RAISE WARNING 'Attempted action on already finished task_ids % for %', 
-      _bad_task_ids,
-      _context;
+    PERFORM async.log(
+      'WARNING',
+      format(
+        'Attempted action on already finished task_ids %s for %s', 
+        _bad_task_ids,
+        _context));
   END IF;
 
   RETURN _eligible_task_ids;
@@ -552,11 +570,13 @@ DECLARE
 BEGIN
   IF _pid IS DISTINCT FROM _orchestrator_pid
   THEN
-    RAISE EXCEPTION 
-      'pid % attempted illegal action % reserved to orchestrator pid %',
-      _pid, 
-      _context,
-      _orchestrator_pid;
+    PERFORM async.log(
+      'ERROR',
+      format(
+        'pid %s attempted illegal action %s reserved to orchestrator pid %s',
+        _pid, 
+        _context,
+        _orchestrator_pid));
   END IF;
 END;
 $$ LANGUAGE PLPGSQL;
@@ -598,12 +618,12 @@ BEGIN
       AND source = 'finish_async'
       AND _status = 'FINISHED')
   THEN
-    RAISE NOTICE 
-      'Finishing task ids {%} via % with status, "%"%', 
+    PERFORM async.log(format(
+      'Finishing task ids {%s} via %s with status, "%s"%s',   
       array_to_string(_task_ids, ', '),
       _context,
       _status,
-      COALESCE(' via: ' || _error_message, '');
+      COALESCE(' via: ' || _error_message, '')));
   END IF;
 
   /* Cancel queries and disconnect as appropriate.  Any "non-success" result
@@ -791,7 +811,7 @@ $$
 DECLARE
   g async.control;  
 BEGIN 
-  RAISE NOTICE 'Heavy maintenance';
+  PERFORM async.log('Performing heavy maintenance');
 
   SELECT INTO g * FROM async.control;
 
@@ -987,7 +1007,7 @@ BEGIN
           PERFORM async.log('Nothing to do. sleeping');
         END IF;
 
-        PERFORM pg_sleep(0.1);
+        PERFORM pg_sleep(0.00001);
       ELSE
         PERFORM pg_sleep(g.idle_sleep);  
       END IF;
