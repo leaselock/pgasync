@@ -27,7 +27,8 @@ CREATE TABLE async.control
   last_heavy_maintenance TIMESTAMPTZ,
   running_since TIMESTAMPTZ,
   paused BOOL NOT NULL DEFAULT false,
-  pid INT /* pid of main background process */
+  pid INT, /* pid of main background process */
+  busy_sleep FLOAT8 DEFAULT 0.1
 );
 
 CREATE UNIQUE INDEX ON async.control((1));
@@ -175,6 +176,36 @@ CREATE OR REPLACE VIEW async.v_target AS
   FROM async.target t
   LEFT JOIN async.worker USING(target)
   GROUP BY target;
+
+
+CREATE OR REPLACE VIEW async.v_target_status AS
+  SELECT 
+    target,
+    COUNT(*) AS tasks_entered_24h,
+    COUNT(*) FILTER(WHERE entered >= now() - '1 hour'::INTERVAL) 
+      AS tasks_entered_1h,
+    COUNT(*) FILTER(WHERE entered >= now() - '1 minute'::INTERVAL) 
+      AS tasks_entered_1m,    
+    COUNT(*) FILTER (WHERE consumed IS NULL AND processed IS NULL) AS tasks_pending,
+    COUNT(*) FILTER (WHERE processed IS NULL AND yielded IS NULL) AS tasks_running,
+    COUNT(*) FILTER (WHERE processed IS NULL AND yielded IS NOT NULL) AS tasks_yielded,
+    COALESCE(cpt.workers, 0) AS concurency_assigned_workers,
+    COUNT(*) FILTER (
+        WHERE 
+          consumed IS NOT NULL 
+          AND processed IS NULL
+          AND t.concurrency_pool IS DISTINCT FROM t.target) 
+      AS concurrency_external_pool,
+    COALESCE(cp.max_workers, target.max_concurrency) AS concurency_max_workers
+  FROM async.target
+  LEFT JOIN async.task t USING(target)
+  LEFT JOIN async.concurrency_pool cp ON 
+    target.target = cp.concurrency_pool
+  LEFT JOIN async.concurrency_pool_tracker cpt ON 
+    cp.concurrency_pool = cpt.concurrency_pool
+  WHERE entered >= now() - '1 day'::INTERVAL
+  GROUP BY target, cp.concurrency_pool, cpt.concurrency_pool
+  ORDER BY target;
 
 
 /* set up the table that manages tracking of threads in flight. Also set
@@ -604,6 +635,7 @@ DECLARE
   r RECORD;
   _disconnect BOOL;
   _task_id_keep_connections INT[];
+  _level TEXT;
 BEGIN
   /* only the orchestration process is allowed to finish tasks */
   PERFORM async.check_orchestrator('finish()');
@@ -618,12 +650,16 @@ BEGIN
       AND source = 'finish_async'
       AND _status = 'FINISHED')
   THEN
-    PERFORM async.log(format(
-      'Finishing task ids {%s} via %s with status, "%s"%s',   
-      array_to_string(_task_ids, ', '),
-      _context,
-      _status,
-      COALESCE(' via: ' || _error_message, '')));
+    _level := CASE WHEN _status = 'FAILED' THEN 'WARNING' ELSE 'NOTICE' END;
+
+    PERFORM async.log(
+      _level,
+      format(
+        'Finishing task ids {%s} via %s with status, "%s"%s',   
+        array_to_string(_task_ids, ', '),
+        _context,
+        _status,
+        COALESCE(' via: ' || _error_message, '')));
   END IF;
 
   /* Cancel queries and disconnect as appropriate.  Any "non-success" result
@@ -826,14 +862,33 @@ $$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE FUNCTION async.do_work() RETURNS BOOL AS
 $$
+DECLARE
+  _when TIMESTAMPTZ;
+  _reap_time INTERVAL;
+  _run_time INTERVAL;
+
+  _debug BOOL DEFAULT FALSE;
+  _did_stuff BOOL;
 BEGIN
   PERFORM async.heavy_maintenance() 
   FROM async.control
   WHERE clock_timestamp() > last_heavy_maintenance + heavy_maintenance_sleep;
   
-  PERFORM async.reap_tasks();
+  IF _debug THEN
+    _when := clock_timestamp();
+    PERFORM async.reap_tasks();
+    _reap_time := clock_timestamp() - _when;
 
-  RETURN async.run_tasks();
+    _when := clock_timestamp();
+    _did_stuff := async.run_tasks();
+    _run_time := clock_timestamp() - _when;
+
+    PERFORM async.log(format('timing: reap: %s run: %s', _reap_time, _run_time));
+    RETURN _did_stuff;
+  ELSE
+    PERFORM async.reap_tasks();
+    RETURN async.run_tasks();
+  END IF;
 END;  
 $$ LANGUAGE PLPGSQL;
 
@@ -979,6 +1034,8 @@ BEGIN
 
   PERFORM async.log('Initialization of query processor complete');    
   LOOP
+    SELECT INTO g * FROM async.control;
+
     IF NOT g.Paused
     THEN
       _did_stuff := async.do_work();
@@ -992,7 +1049,7 @@ BEGIN
       _show_message := true;
       _last_did_stuff := clock_timestamp();
     ELSE
-      IF NOT (SELECT enabled FROM async.control)
+      IF NOT g.enabled
       THEN
         RETURN;
       END IF;    
@@ -1007,7 +1064,7 @@ BEGIN
           PERFORM async.log('Nothing to do. sleeping');
         END IF;
 
-        PERFORM pg_sleep(0.00001);
+        PERFORM pg_sleep(g.busy_sleep);
       ELSE
         PERFORM pg_sleep(g.idle_sleep);  
       END IF;
@@ -1018,33 +1075,6 @@ $$ LANGUAGE PLPGSQL;
 
 
 
-CREATE OR REPLACE VIEW async.v_target_status AS
-  SELECT 
-    target,
-    COUNT(*) AS tasks_entered_24h,
-    COUNT(*) FILTER(WHERE entered >= now() - '1 hour'::INTERVAL) 
-      AS tasks_entered_1h,
-    COUNT(*) FILTER(WHERE entered >= now() - '1 minute'::INTERVAL) 
-      AS tasks_entered_1m,    
-    COUNT(*) FILTER (WHERE consumed IS NULL AND processed IS NULL) AS tasks_pending,
-    COUNT(*) FILTER (WHERE processed IS NULL AND yielded IS NULL) AS tasks_running,
-    COUNT(*) FILTER (WHERE processed IS NULL AND yielded IS NOT NULL) AS tasks_yielded,
-    COALESCE(cpt.workers, 0) AS concurency_assigned_workers,
-    COUNT(*) FILTER (
-        WHERE 
-          consumed IS NOT NULL 
-          AND processed IS NULL
-          AND t.concurrency_pool IS DISTINCT FROM t.target) 
-      AS concurrency_external_pool,
-    COALESCE(cp.max_workers, target.max_concurrency) AS concurency_max_workers
-  FROM async.target
-  LEFT JOIN async.task t USING(target)
-  LEFT JOIN async.concurrency_pool cp ON 
-    target.target = cp.concurrency_pool
-  LEFT JOIN async.concurrency_pool_tracker cpt ON 
-    cp.concurrency_pool = cpt.concurrency_pool
-  WHERE entered >= now() - '1 day'::INTERVAL
-  GROUP BY target, cp.concurrency_pool, cpt.concurrency_pool
-  ORDER BY target;
+
 
 
