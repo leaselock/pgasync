@@ -28,7 +28,11 @@ CREATE TABLE async.control
   running_since TIMESTAMPTZ,
   paused BOOL NOT NULL DEFAULT false,
   pid INT, /* pid of main background process */
-  busy_sleep FLOAT8 DEFAULT 0.1
+  busy_sleep FLOAT8 DEFAULT 0.1,
+
+  light_maintenance_sleep INTERVAL DEFAULT '5 minutes'::INTERVAL,
+  last_light_maintenance TIMESTAMPTZ
+
 );
 
 CREATE UNIQUE INDEX ON async.control((1));
@@ -842,20 +846,37 @@ $$ LANGUAGE PLPGSQL;
 
 
 
-CREATE OR REPLACE FUNCTION async.heavy_maintenance() RETURNS VOID AS
+CREATE OR REPLACE FUNCTION async.maintenance() RETURNS VOID AS
 $$
 DECLARE
-  g async.control;  
+  g async.control;
+  _bad_pools TEXT[];
 BEGIN 
-  PERFORM async.log('Performing heavy maintenance');
-
   SELECT INTO g * FROM async.control;
 
-  DELETE FROM async.task 
-  WHERE processed < clock_timestamp() - g.task_keep_duration;
+  IF now() > g.last_heavy_maintenance + g.heavy_maintenance_sleep
+    OR g.last_heavy_maintenance IS NULL
+  THEN
+    PERFORM async.log('Performing heavy maintenance');
+    UPDATE async.control SET last_heavy_maintenance = now();
+  END IF;
 
-  DELETE FROM async.server_log 
-  WHERE happened < clock_timestamp() - g.task_keep_duration;
+  IF now() > g.last_light_maintenance + g.light_maintenance_sleep
+    OR g.last_light_maintenance IS NULL
+  THEN
+    PERFORM async.log('Performing light maintenance');
+
+    DELETE FROM async.concurrency_pool_tracker
+    WHERE 
+      workers < 0
+      OR 
+      (
+        workers = 0
+        AND concurrency_pool NOT IN (SELECT target FROM async.target)
+      );
+
+    UPDATE async.control SET last_light_maintenance = now();
+  END IF;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -870,9 +891,7 @@ DECLARE
   _debug BOOL DEFAULT FALSE;
   _did_stuff BOOL;
 BEGIN
-  PERFORM async.heavy_maintenance() 
-  FROM async.control
-  WHERE clock_timestamp() > last_heavy_maintenance + heavy_maintenance_sleep;
+  PERFORM async.maintenance();
   
   IF _debug THEN
     _when := clock_timestamp();
