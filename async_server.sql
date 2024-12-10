@@ -1024,8 +1024,8 @@ BEGIN
   /* dragons live forever, but not so little boys */
   SET statement_timeout = 0;
   
-  /* run heavy maitenance now as a precaution */
-  PERFORM async.heavy_maintenance();
+  /* run maintenance now as a precaution */
+  PERFORM async.maintenance();
 
   /* attempt to acquire process lock */
   PERFORM async.log('Initializing workers');
