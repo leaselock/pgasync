@@ -166,18 +166,13 @@ making use of optional arguments:
       concurrency_pool TEXT DEFAULT NULL) RETURNS async.task_push_t AS  
 
 _run_type: allows fo the following:
-
     'EXECUTE':         run task normally
-
     'DOA':             place task into queue dead ('Dead On Arrival') not useful 
-                       except when extending the library.  
-         
+                       except when extending the library.       
     'EXECUTE_NOASYNC': run task, but do not set complete when it is invoked.
                        this basically overrides the target flag.
-
 _source: An arbitrary text field to allow the caller to record who/what 
          initiated the task.
-
 ## Examples:
 
 push a single 'select 0' on the queue against self:
@@ -238,7 +233,7 @@ push a single 'select 0' on the queue against self:
      kept.
 
 
-  Q: Why build a query processing queue in a database? Is this sorcery? Are you 
+  Q: Why build a query processing queue in a database? Is this sorcery? Are you
      insane? Why not use an established orchesrtation engine such as airflow 
      instead?
 
