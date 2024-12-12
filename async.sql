@@ -134,6 +134,13 @@ BEGIN
     SELECT t.concurrency_pool FROM tmp_concurrency_pool t);
 
   DROP TABLE tmp_concurrency_pool;
+
+  INSERT INTO async.concurrency_pool SELECT 
+    target,
+    max_concurrency
+  FROM async.target 
+    ON CONFLICT ON CONSTRAINT concurrency_pool_pkey DO UPDATE SET
+      max_workers = EXCLUDED.max_workers;
 END;
 $$ LANGUAGE PLPGSQL;
 

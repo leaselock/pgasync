@@ -31,7 +31,9 @@ CREATE TABLE async.control
   busy_sleep FLOAT8 DEFAULT 0.1,
 
   light_maintenance_sleep INTERVAL DEFAULT '5 minutes'::INTERVAL,
-  last_light_maintenance TIMESTAMPTZ
+  last_light_maintenance TIMESTAMPTZ,
+
+  default_concurrency_pool_workers INT DEFAULT 4
 
 );
 
@@ -235,6 +237,7 @@ BEGIN
   END IF;
 
   DELETE FROM async.concurrency_pool_tracker;
+
   INSERT INTO async.worker SELECT 
     s,
     'async.worker_' || s
@@ -302,7 +305,9 @@ SELECT * FROM
       LIMIT (SELECT g.workers * 2 FROM async.control g)
     ) q
   ) q
-  WHERE n <= COALESCE(max_workers - workers, 4)
+  WHERE n <= COALESCE(
+    max_workers - workers, 
+    (SELECT default_concurrency_pool_workers FROM async.control))
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
 
@@ -514,7 +519,7 @@ BEGIN
       SELECT
         r.concurrency_pool,
         1,
-        COALESCE(cp.max_workers, 4)
+        COALESCE(cp.max_workers, c.default_concurrency_pool_workers)
       FROM
       (
         SELECT r.concurrency_pool
@@ -864,8 +869,6 @@ BEGIN
   IF now() > g.last_light_maintenance + g.light_maintenance_sleep
     OR g.last_light_maintenance IS NULL
   THEN
-    PERFORM async.log('Performing light maintenance');
-
     DELETE FROM async.concurrency_pool_tracker
     WHERE 
       workers < 0
