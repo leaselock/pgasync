@@ -83,7 +83,9 @@ BEGIN
     default_timeout = COALESCE(t.default_timeout, c.default_timeout),
     self_target = COALESCE(t.self_target, c.self_target),
     self_connection_string = COALESCE(t.self_connection_string, c.self_connection_string),
-    self_concurrency = COALESCE(t.self_concurrency, c.self_concurrency)
+    self_concurrency = COALESCE(t.self_concurrency, c.self_concurrency),
+    light_maintenance_sleep = COALESCE(t.light_maintenance_sleep, c.light_maintenance_sleep),
+    default_concurrency_pool_workers = COALESCE(t.default_concurrency_pool_workers, c.default_concurrency_pool_workers)
   FROM 
   (
     SELECT * FROM jsonb_populate_record(
