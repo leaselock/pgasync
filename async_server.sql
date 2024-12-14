@@ -91,6 +91,12 @@ WHERE
   AND yielded IS NULL
   AND processed IS NULL;
 
+CREATE INDEX ON async.task(concurrency_pool, priority, entered) 
+WHERE 
+  consumed IS NULL
+  AND yielded IS NULL
+  AND processed IS NULL;  
+
 CREATE INDEX ON async.task(times_up)
   WHERE 
     processed IS NULL
@@ -120,6 +126,10 @@ CREATE UNLOGGED TABLE async.concurrency_pool_tracker
   workers INT,
   max_workers INT DEFAULT 8
 );
+
+CREATE INDEX ON async.concurrency_pool_tracker(
+  concurrency_pool, workers, max_workers)
+WHERE workers < max_workers;
 
 CREATE TABLE async.server_log
 (
@@ -238,6 +248,10 @@ BEGIN
 
   DELETE FROM async.concurrency_pool_tracker;
 
+  PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
+  FROM async.task
+  WHERE processed IS NULL;
+
   INSERT INTO async.worker SELECT 
     s,
     'async.worker_' || s
@@ -280,7 +294,7 @@ $$ LANGUAGE PLPGSQL;
 
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS
-SELECT * FROM
+  SELECT * FROM
   (
     SELECT 
       *,
@@ -295,12 +309,12 @@ SELECT * FROM
         pt.workers      
       FROM async.task t
       JOIN async.target tg USING(target)
-      LEFT JOIN async.concurrency_pool_tracker pt USING(concurrency_pool)    
+      JOIN async.concurrency_pool_tracker pt USING(concurrency_pool)
       WHERE 
         t.consumed IS NULL
         AND t.processed IS NULL
         AND t.yielded IS NULL  
-        AND (pt.concurrency_pool IS NULL OR pt.max_workers > pt.workers)
+        AND pt.workers < pt.max_workers 
       ORDER BY priority, entered
       LIMIT (SELECT g.workers * 2 FROM async.control g)
     ) q
@@ -408,6 +422,33 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+
+CREATE OR REPLACE FUNCTION async.set_concurrency_pool_tracker(
+  _pools TEXT[]) RETURNS VOID AS
+$$
+DECLARE
+  c RECORD;
+BEGIN
+  SELECT INTO c * FROM async.control;
+
+  INSERT INTO async.concurrency_pool_tracker(
+    concurrency_pool,
+    workers,
+    max_workers)
+  SELECT
+    q.concurrency_pool,
+    0,
+    COALESCE(cp.max_workers, c.default_concurrency_pool_workers)
+  FROM
+  (
+    SELECT unnest(_pools) AS concurrency_pool
+  ) q
+  LEFT JOIN async.concurrency_pool cp USING(concurrency_pool)
+  ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 /* returns true if at least one task was run */
 CREATE OR REPLACE FUNCTION async.run_tasks(did_stuff OUT BOOL) RETURNS BOOL AS
 $$
@@ -512,21 +553,9 @@ BEGIN
           END,
           w.connect_action));
 
-      INSERT INTO async.concurrency_pool_tracker(
-        concurrency_pool,
-        workers,
-        max_workers)
-      SELECT
-        r.concurrency_pool,
-        1,
-        COALESCE(cp.max_workers, c.default_concurrency_pool_workers)
-      FROM
-      (
-        SELECT r.concurrency_pool
-      )
-      LEFT JOIN async.concurrency_pool cp USING(concurrency_pool)
-      ON CONFLICT ON CONSTRAINT concurrency_pool_tracker_pkey DO UPDATE SET
-        workers = concurrency_pool_tracker.workers + 1;
+      UPDATE async.concurrency_pool_tracker
+      SET workers = workers + 1
+      WHERE concurrency_pool = r.concurrency_pool;
 
     EXCEPTION WHEN OTHERS THEN
       PERFORM async.log(
@@ -576,7 +605,7 @@ BEGIN
       'WARNING',
       format(
         'Attempted action on bad task_ids %s for %s', 
-        _bad_task_ids,
+        _missing_task_ids,
         _context));
   END IF;
 
@@ -587,7 +616,7 @@ BEGIN
       'WARNING',
       format(
         'Attempted action on already finished task_ids %s for %s', 
-        _bad_task_ids,
+        _duplicate_task_ids,
         _context));
   END IF;
 
@@ -762,7 +791,7 @@ BEGIN
       AND consumed IS NOT NULL
       AND concurrency_pool != (SELECT self_target FROM async.control)
       AND _status != 'DOA'
-      AND source != 'run deferred task'
+      AND source IS DISTINCT FROM 'run deferred task'
       AND 
       (
         concurrency_processed = now()
@@ -771,7 +800,6 @@ BEGIN
     GROUP BY 1
   ) q
   WHERE p.concurrency_pool = q.concurrency_pool;
- 
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -869,13 +897,22 @@ BEGIN
   IF now() > g.last_light_maintenance + g.light_maintenance_sleep
     OR g.last_light_maintenance IS NULL
   THEN
-    DELETE FROM async.concurrency_pool_tracker
+    DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
-      workers < 0
-      OR 
+      NOT EXISTS (
+        SELECT 1 FROM async.task t
+        WHERE 
+          t.processed IS NULL
+          AND t.concurrency_pool = cpt.concurrency_pool
+      )
+      AND
       (
-        workers = 0
-        AND concurrency_pool NOT IN (SELECT target FROM async.target)
+        workers < 0
+        OR 
+        (
+          workers = 0
+          AND concurrency_pool NOT IN (SELECT target FROM async.target)
+        )
       );
 
     UPDATE async.control SET last_light_maintenance = now();
@@ -891,7 +928,7 @@ DECLARE
   _reap_time INTERVAL;
   _run_time INTERVAL;
 
-  _debug BOOL DEFAULT FALSE;
+  _debug BOOL DEFAULT false;
   _did_stuff BOOL;
 BEGIN
   PERFORM async.maintenance();
@@ -905,7 +942,10 @@ BEGIN
     _did_stuff := async.run_tasks();
     _run_time := clock_timestamp() - _when;
 
-    PERFORM async.log(format('timing: reap: %s run: %s', _reap_time, _run_time));
+    PERFORM async.log(
+      format(
+        'timing: reap: %s run: %s did_stuff = %s', 
+        _reap_time, _run_time, _did_stuff));
     RETURN _did_stuff;
   ELSE
     PERFORM async.reap_tasks();
@@ -1075,7 +1115,7 @@ BEGIN
       THEN
         RETURN;
       END IF;    
-
+ 
       /* wait a little bit before showing message, and be aggressive */      
       IF _show_message 
       THEN

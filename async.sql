@@ -240,6 +240,7 @@ $$
 DECLARE 
   _debug BOOL DEFAULT false;
   _tasks_out BIGINT[];
+  _pools_out TEXT[];
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
@@ -302,7 +303,14 @@ BEGIN
     JOIN async.target t USING(target)
     RETURNING *
   ) 
-  SELECT INTO _tasks_out array_agg(d.task_id) FROM data d;
+  SELECT INTO 
+    _tasks_out, 
+    _pools_out
+    array_agg(d.task_id),
+    array_agg(DISTINCT concurrency_pool) FILTER (WHERE processed IS NULL)
+  FROM data d;
+
+  PERFORM async.set_concurrency_pool_tracker(_pools_out);
 
   IF _debug
   THEN
