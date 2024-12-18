@@ -292,6 +292,33 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+/*
+WITH candidates AS
+(
+  SELECT * 
+  FROM async.task 
+  WHERE concurrency_pool IN (
+      SELECT concurrency_pool 
+      FROM async.concurrency_pool_tracker 
+      WHERE workers < max_workers) 
+    AND processed IS NULL 
+    AND consumed IS NULL 
+    AND yielded IS NULL
+)
+SELECT * 
+FROM 
+(
+  SELECT 
+    *,
+    row_number() OVER (PARTITION BY concurrency_pool) n
+  FROM candidates
+  JOIN async.concurrency_pool_tracker USING(concurrency_pool)
+) q
+WHERE n < max_workers - workers
+ORDER BY priority, entered
+LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);  
+
+*/
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS
   SELECT * FROM
@@ -1073,10 +1100,8 @@ BEGIN
   /* attempt to acquire process lock */
   PERFORM async.log('Initializing workers');
 
-  /* attempt to acquire process lock */
-  PERFORM async.log('Cleaning up unfinished tasks (if any)');
-
   /* clear out any tasks that may have been left in running state */
+  PERFORM async.log('Cleaning up unfinished tasks (if any)');
   UPDATE async.task SET 
     processed = now(),
     failed = true,
