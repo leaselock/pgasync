@@ -234,7 +234,7 @@ push a single 'select 0' on the queue against self:
 
 
   Q: Why build a query processing queue in a database? Is this sorcery? Are you
-     insane? Why not use an established orchesrtation engine such as airflow 
+     insane? Why not use an established orchestration engine such as airflow 
      instead?
 
   A: Orchestating postgres queries from postgres itself leads to simplicity and
