@@ -59,7 +59,7 @@ CREATE OR REPLACE FUNCTION async.server(
   _new_connection_string INOUT TEXT DEFAULT NULL) RETURNS TEXT AS
 $$
 BEGIN
-  INSERT INTO  async.client_control DEFAULT VALUES;
+  INSERT INTO async.client_control DEFAULT VALUES ON CONFLICT DO NOTHING;
   
   IF _new_connection_string IS NOT NULL
   THEN
