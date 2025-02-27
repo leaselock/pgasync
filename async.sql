@@ -40,7 +40,8 @@ CREATE TYPE async.task_push_t AS
   target TEXT,
   priority INT,
   query TEXT,
-  concurrency_pool TEXT
+  concurrency_pool TEXT,
+  manual_timeout INTERVAL
 );
 
 
@@ -176,7 +177,21 @@ BEGIN
     RETURN;
   END IF; 
 
+  IF _task_ids IS NULL OR array_upper(_task_ids, 1) = 0
+  THEN
+    PERFORM async.log('WARNING', 'Attempt to finish null task array');
+    RETURN;
+  END IF;
+
   _task_ids := async.check_task_ids(_task_ids, 'finish_async');
+
+  IF _task_ids IS NULL OR array_upper(_task_ids, 1) = 0
+  THEN
+    PERFORM async.log(
+      'WARNING', 
+      'Attempt to finish null task array after check');
+    RETURN;
+  END IF;  
 
   /* is this a foreground request? If so, convert to task */
   IF pg_backend_pid() = (SELECT pid FROM async.control) 
@@ -198,6 +213,7 @@ BEGIN
           quote_literal(_status),
           quote_literal('finish_async'),
           quote_nullable(_error_message)),
+        NULL,
         NULL
       )::async.task_push_t],
       _source := 'finish_async')
@@ -222,9 +238,10 @@ CREATE OR REPLACE FUNCTION async.task(
   target TEXT,
   task_data JSONB DEFAULT NULL,
   priority INT DEFAULT 0,
-  concurrency_pool TEXT DEFAULT NULL) RETURNS async.task_push_t AS
+  concurrency_pool TEXT DEFAULT NULL,
+  manual_timeout INTERVAL DEFAULT NULL) RETURNS async.task_push_t AS
 $$
-  SELECT ($3, $2, $4, $1, $5)::async.task_push_t;
+  SELECT ($3, $2, $4, $1, $5, $6)::async.task_push_t;
 $$ LANGUAGE SQL IMMUTABLE;
 
 
@@ -278,7 +295,8 @@ BEGIN
       consumed,
       processed,
       source,
-      concurrency_pool)
+      concurrency_pool,
+      manual_timeout)
     SELECT 
       q.task_data,
       q.target,
@@ -296,7 +314,8 @@ BEGIN
       CASE WHEN _run_type IN('DOA', 'EMPTY') THEN clock_timestamp() END,
       CASE WHEN _run_type IN('DOA', 'EMPTY') THEN clock_timestamp() END,
       _source,
-      COALESCE(q.concurrency_pool, t.target)
+      COALESCE(q.concurrency_pool, t.target),
+      q.manual_timeout
     FROM 
     (
       SELECT * 

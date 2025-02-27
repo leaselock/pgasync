@@ -81,7 +81,9 @@ CREATE TABLE async.task
   concurrency_pool TEXT,
 
   /* alterate processing time for concurrency tracking purposes */
-  concurrency_processed TIMESTAMPTZ
+  concurrency_processed TIMESTAMPTZ,
+
+  manual_timeout INTERVAL
 );
 
 /* supports fetching eligible tasks */
@@ -433,7 +435,9 @@ BEGIN
     _failed := true;
 
     GET STACKED DIAGNOSTICS _context = pg_exception_context;
-    _error_message := format(E'%s\ncontext: %s', SQLERRM, _context);
+    _error_message := format(
+      E'query: %s errored with:\n%s\ncontext: %s', 
+      _query, SQLERRM, _context);
   END;
 
   PERFORM async.finish_internal(
@@ -564,7 +568,10 @@ BEGIN
 
       UPDATE async.task SET 
         consumed = clock_timestamp(),
-        times_up = now() + COALESCE(r.default_timeout, c.default_timeout)
+        times_up = now() + COALESCE(
+          manual_timeout, 
+          r.default_timeout, 
+          c.default_timeout)
       WHERE task_id = r.task_id;
 
       PERFORM async.log(
@@ -635,7 +642,6 @@ BEGIN
         _missing_task_ids,
         _context));
   END IF;
-
 
   IF array_upper(_duplicate_task_ids, 1) > 0
   THEN
