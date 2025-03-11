@@ -83,7 +83,9 @@ CREATE TABLE async.task
   /* alterate processing time for concurrency tracking purposes */
   concurrency_processed TIMESTAMPTZ,
 
-  manual_timeout INTERVAL
+  manual_timeout INTERVAL,
+
+  tracked BOOL
 );
 
 /* supports fetching eligible tasks */
@@ -155,7 +157,6 @@ $$
 BEGIN
   IF _level = 'NOTICE'
   THEN 
-    RAISE NOTICE '%', _message;
   ELSEIF _level = 'WARNING'
   THEN
     RAISE WARNING '%', _message;
@@ -571,7 +572,8 @@ BEGIN
         times_up = now() + COALESCE(
           manual_timeout, 
           r.default_timeout, 
-          c.default_timeout)
+          c.default_timeout),
+        tracked = true
       WHERE task_id = r.task_id;
 
       PERFORM async.log(
@@ -797,6 +799,7 @@ BEGIN
     running_since = NULL
   WHERE task_id = ANY(_task_ids);   
 
+
   /* mark task complete! */
   UPDATE async.task SET
     processed = CASE 
@@ -810,26 +813,24 @@ BEGIN
     finish_status = NULLIF(_status, 'PAUSED')
   WHERE task_id = ANY(_task_ids);
 
+  WITH untrack AS
+  (
+    UPDATE async.task SET
+      tracked = false
+    WHERE 
+      tracked
+      AND processed IS NOT NULL 
+      AND task_id = any(_task_ids)
+    RETURNING concurrency_pool   
+  )
   UPDATE async.concurrency_pool_tracker p SET 
-    workers = workers - count
-  FROM
+    workers = workers - newly_finished
+  FROM 
   (
     SELECT 
       concurrency_pool, 
-      count(*)
-    FROM async.task
-    WHERE 
-      task_id = ANY(_task_ids)
-      AND concurrency_pool IS NOT NULL
-      AND consumed IS NOT NULL
-      AND concurrency_pool != (SELECT self_target FROM async.control)
-      AND _status != 'DOA'
-      AND source IS DISTINCT FROM 'run deferred task'
-      AND 
-      (
-        concurrency_processed = now()
-        OR (processed IS NOT NULL AND concurrency_processed IS NULL)
-      ) 
+      count(*) AS newly_finished
+    FROM untrack
     GROUP BY 1
   ) q
   WHERE p.concurrency_pool = q.concurrency_pool;
