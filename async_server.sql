@@ -836,10 +836,10 @@ BEGIN
         tracked
         AND (
           processed IS NOT NULL 
-          /*OR (
+          OR (
             yielded IS NOT NULL
             AND NOT COALESCE(concurrency_track_yielded, false)
-          ) */
+          ) 
         )
         AND task_id = any(_task_ids)
     ) t2
