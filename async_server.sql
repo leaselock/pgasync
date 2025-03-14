@@ -46,7 +46,9 @@ CREATE TABLE async.target
   max_concurrency INT DEFAULT 8,
   connection_string TEXT,
   asynchronous_finish BOOL DEFAULT false,
-  default_timeout INTERVAL
+  default_timeout INTERVAL,
+  /* if true, yielded threads will not release concurrency slot */
+  concurrency_track_yielded BOOL DEFAULT false 
 );
 
 
@@ -85,6 +87,9 @@ CREATE TABLE async.task
 
   manual_timeout INTERVAL,
 
+  /* this task is counted for purposes of determining how many threads are 
+   * running in a concurrency pool
+   */
   tracked BOOL
 );
 
@@ -815,14 +820,32 @@ BEGIN
 
   WITH untrack AS
   (
-    UPDATE async.task SET
-      tracked = false
-    WHERE 
-      tracked
-      AND processed IS NOT NULL 
-      AND task_id = any(_task_ids)
-    RETURNING concurrency_pool   
-  )
+    /* manage concurrency pool thread count. If finished, it will bet set false,
+     * but if yielded, it will be set null to revert to original state.
+     */
+    UPDATE async.task t SET
+      tracked = CASE WHEN processed IS NOT NULL THEN false END
+    FROM
+    (
+      SELECT
+        concurrency_pool,
+        task_id
+      FROM async.task t
+      LEFT JOIN async.target tg USING(target)
+      WHERE 
+        tracked
+        AND (
+          processed IS NOT NULL 
+          /*OR (
+            yielded IS NOT NULL
+            AND NOT COALESCE(concurrency_track_yielded, false)
+          ) */
+        )
+        AND task_id = any(_task_ids)
+    ) t2
+    WHERE t.task_id = t2.task_id
+    RETURNING t.concurrency_pool   
+  ) 
   UPDATE async.concurrency_pool_tracker p SET 
     workers = workers - newly_finished
   FROM 
@@ -926,6 +949,8 @@ BEGIN
   THEN
     PERFORM async.log('Performing heavy maintenance');
     UPDATE async.control SET last_heavy_maintenance = now();
+
+    DELETE FROM async.task WHERE processed <= now() - g.task_keep_duration;
   END IF;
 
   IF now() > g.last_light_maintenance + g.light_maintenance_sleep

@@ -114,7 +114,8 @@ BEGIN
        max_concurrency = COALESCE(excluded.max_concurrency, target.max_concurrency),
        connection_string = COALESCE(excluded.connection_string, target.connection_string),
        asynchronous_finish = COALESCE(excluded.asynchronous_finish, target.asynchronous_finish),
-       default_timeout = COALESCE(excluded.default_timeout, target.default_timeout);
+       default_timeout = COALESCE(excluded.default_timeout, target.default_timeout),
+       concurrency_track_yielded = COALESCE(excluded.concurrency_track_yielded, target.concurrency_track_yielded);
 
   DELETE FROM async.worker WHERE target NOT IN (SELECT target FROM tmp_target);
   DELETE FROM async.target WHERE target NOT IN (SELECT target FROM tmp_target);
