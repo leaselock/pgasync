@@ -534,6 +534,19 @@ BEGIN
     LIMIT 1;
 
     BEGIN
+      PERFORM async.log(
+        format(
+          'Running task id %s pool %s slot: %s %s %s[action %s]', 
+          r.task_id, 
+          r.concurrency_pool,
+          w.slot,
+          COALESCE('data: "' || r.task_data::TEXT || '" ', ''),
+          CASE WHEN r.source IS NOT NULL
+            THEN format('via %s ',  r.source)
+            ELSE ''
+          END,
+          w.connect_action));
+    
       IF w.connect_action = 'keep'
       THEN
         BEGIN
@@ -581,19 +594,6 @@ BEGIN
         tracked = true
       WHERE task_id = r.task_id;
 
-      PERFORM async.log(
-        format(
-          'Running task id %s pool %s slot: %s %s %s[action %s]', 
-          r.task_id, 
-          r.concurrency_pool,
-          w.slot,
-          COALESCE('data: "' || r.task_data::TEXT || '" ', ''),
-          CASE WHEN r.source IS NOT NULL
-            THEN format('via %s ',  r.source)
-            ELSE ''
-          END,
-          w.connect_action));
-
       UPDATE async.concurrency_pool_tracker
       SET workers = workers + 1
       WHERE concurrency_pool = r.concurrency_pool;
@@ -601,7 +601,7 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
       PERFORM async.log(
         'WARNING',
-        format('Got %s when attempting to run task', SQLERRM));
+        format('Got %s when attempting to run task %s', r.task_id, SQLERRM));
 
       UPDATE async.task SET 
         consumed = clock_timestamp(),
