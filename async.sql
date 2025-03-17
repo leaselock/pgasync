@@ -41,7 +41,8 @@ CREATE TYPE async.task_push_t AS
   priority INT,
   query TEXT,
   concurrency_pool TEXT,
-  manual_timeout INTERVAL
+  manual_timeout INTERVAL,
+  track_yielded BOOL
 );
 
 
@@ -215,6 +216,7 @@ BEGIN
           quote_literal('finish_async'),
           quote_nullable(_error_message)),
         NULL,
+        NULL,
         NULL
       )::async.task_push_t],
       _source := 'finish_async')
@@ -240,9 +242,10 @@ CREATE OR REPLACE FUNCTION async.task(
   task_data JSONB DEFAULT NULL,
   priority INT DEFAULT 0,
   concurrency_pool TEXT DEFAULT NULL,
-  manual_timeout INTERVAL DEFAULT NULL) RETURNS async.task_push_t AS
+  manual_timeout INTERVAL DEFAULT NULL,
+  track_yielded BOOL DEFAULT NULL) RETURNS async.task_push_t AS
 $$
-  SELECT ($3, $2, $4, $1, $5, $6)::async.task_push_t;
+  SELECT ($3, $2, $4, $1, $5, $6, $7)::async.task_push_t;
 $$ LANGUAGE SQL IMMUTABLE;
 
 
@@ -297,7 +300,8 @@ BEGIN
       processed,
       source,
       concurrency_pool,
-      manual_timeout)
+      manual_timeout,
+      track_yielded)
     SELECT 
       q.task_data,
       q.target,
@@ -316,7 +320,8 @@ BEGIN
       CASE WHEN _run_type IN('DOA', 'EMPTY') THEN clock_timestamp() END,
       _source,
       COALESCE(q.concurrency_pool, t.target),
-      q.manual_timeout
+      q.manual_timeout,
+      COALESCE(q.track_yielded, t.concurrency_track_yielded, true)
     FROM 
     (
       SELECT * 

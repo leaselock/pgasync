@@ -82,15 +82,14 @@ CREATE TABLE async.task
 
   concurrency_pool TEXT,
 
-  /* alterate processing time for concurrency tracking purposes */
-  concurrency_processed TIMESTAMPTZ,
-
   manual_timeout INTERVAL,
 
   /* this task is counted for purposes of determining how many threads are 
    * running in a concurrency pool
    */
-  tracked BOOL
+  tracked BOOL,
+
+  track_yielded BOOL
 );
 
 /* supports fetching eligible tasks */
@@ -162,6 +161,7 @@ $$
 BEGIN
   IF _level = 'NOTICE'
   THEN 
+    RAISE NOTICE '%', _message;
   ELSEIF _level = 'WARNING'
   THEN
     RAISE WARNING '%', _message;
@@ -493,6 +493,8 @@ DECLARE
   r async.v_candidate_task;
   w RECORD;
   c async.control;
+  _max_retry_count INT DEFAULT 5;
+  _retry_counter INT DEFAULT 1;
 BEGIN 
   did_stuff := false;
 
@@ -570,7 +572,35 @@ BEGIN
 
       IF w.connect_action = 'connect'
       THEN
-        PERFORM dblink_connect(w.name, r.connection_string);
+        LOOP
+          /* give it the old college try...if connection fields repeat a few 
+           * times before giving up.
+           * XXX: Maybe better to yield the task 
+           * back with some future execution time.
+           */
+          BEGIN 
+            PERFORM dblink_connect(w.name, r.connection_string);
+
+            EXIT;
+          EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM = 'could not establish connetction' 
+              AND _retry_counter < _max_retry_count
+            THEN
+              PERFORM async.log(
+                'WARNING',
+                format(
+                  'Retrying failed connection when runnning task %s '
+                  '(attempt %s of %s)', 
+                  r.task_id,
+                  _retry_counter,
+                  _max_retry_count));            
+
+              _retry_counter := _retry_counter + 1;
+            ELSE 
+              RAISE;
+            END IF;
+          END;
+        END LOOP;
       END IF;
 
       /* because the task id is not available to the task creators, inject it
@@ -601,12 +631,13 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
       PERFORM async.log(
         'WARNING',
-        format('Got %s when attempting to run task %s', r.task_id, SQLERRM));
+        format('Got %s when attempting to run task %s', SQLERRM, r.task_id));
 
       UPDATE async.task SET 
         consumed = clock_timestamp(),
         processed = clock_timestamp(),
         failed = true,
+        finish_status = 'FAILED',
         processing_error = SQLERRM
       WHERE task_id = r.task_id;
 
@@ -728,7 +759,7 @@ BEGIN
       AND source = 'finish_async'
       AND _status = 'FINISHED')
   THEN
-    _level := CASE WHEN _status = 'FAILED' THEN 'WARNING' ELSE 'NOTICE' END;
+    _level := 'NOTICE';
 
     PERFORM async.log(
       _level,
@@ -825,25 +856,16 @@ BEGIN
      */
     UPDATE async.task t SET
       tracked = CASE WHEN processed IS NOT NULL THEN false END
-    FROM
-    (
-      SELECT
-        concurrency_pool,
-        task_id
-      FROM async.task t
-      LEFT JOIN async.target tg USING(target)
-      WHERE 
-        tracked
-        AND (
-          processed IS NOT NULL 
-          OR (
-            yielded IS NOT NULL
-            AND NOT COALESCE(concurrency_track_yielded, false)
-          ) 
-        )
-        AND task_id = any(_task_ids)
-    ) t2
-    WHERE t.task_id = t2.task_id
+    WHERE 
+      task_id = any(_task_ids)
+      AND tracked
+      AND (
+        processed IS NOT NULL 
+        OR (
+          yielded IS NOT NULL
+          AND NOT COALESCE(track_yielded, false)
+        ) 
+      )
     RETURNING t.concurrency_pool   
   ) 
   UPDATE async.concurrency_pool_tracker p SET 
@@ -1110,6 +1132,11 @@ BEGIN
   /* yeet! */
   IF NOT g.enabled AND NOT _force
   THEN
+    IF NOT g.enabled
+    THEN
+      PERFORM async.log('Orchestrator is enabled (see async.control). Exiting');
+    END IF;
+
     RETURN;
   END IF;
 
@@ -1122,6 +1149,16 @@ BEGIN
 
   /* attempt to acquire process lock */
   PERFORM async.log('Initializing asynchronous query processor');
+
+  /* if being run from pg_cron, lower client messages to try and minimize log
+   * pollution.
+   */
+  IF (SELECT backend_type FROM pg_stat_activity WHERE pid = pg_backend_pid())
+    = 'pg_cron'
+  THEN
+    PERFORM async.log('pg_cron detected.  Client logging set to WARNING');
+    SET client_min_messages = 'WARNING';
+  END IF;
 
   /* dragons live forever, but not so little boys */
   SET statement_timeout = 0;
