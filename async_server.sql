@@ -106,9 +106,8 @@ WHERE
   AND processed IS NULL;  
 
 CREATE INDEX ON async.task(times_up)
-  WHERE 
-    processed IS NULL
-    AND times_up IS NOT NULL;
+  WHERE processed IS NULL; 
+    
 
 
 CREATE UNLOGGED TABLE async.worker
@@ -300,64 +299,33 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
-/*
-WITH candidates AS
-(
-  SELECT * 
-  FROM async.task 
-  WHERE concurrency_pool IN (
-      SELECT concurrency_pool 
-      FROM async.concurrency_pool_tracker 
-      WHERE workers < max_workers) 
-    AND processed IS NULL 
-    AND consumed IS NULL 
-    AND yielded IS NULL
-)
-SELECT * 
-FROM 
-(
-  SELECT 
-    *,
-    row_number() OVER (PARTITION BY concurrency_pool) n
-  FROM candidates
-  JOIN async.concurrency_pool_tracker USING(concurrency_pool)
-) q
-WHERE n < max_workers - workers
-ORDER BY priority, entered
-LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);  
-
-*/
-
-CREATE OR REPLACE VIEW async.v_candidate_task AS
+CREATE OR REPLACE VIEW async.v_candidate_task AS 
   SELECT * FROM
   (
     SELECT 
-      *,
-      row_number() OVER (PARTITION BY concurrency_pool) n
-    FROM
-    (
-      SELECT 
-        t.*,
-        tg.connection_string,
-        tg.default_timeout,
-        pt.max_workers,
-        pt.workers      
-      FROM async.task t
-      JOIN async.target tg USING(target)
-      JOIN async.concurrency_pool_tracker pt USING(concurrency_pool)
-      WHERE 
-        t.consumed IS NULL
+      t.*,
+      tg.connection_string,
+      tg.default_timeout,
+      pt.max_workers,
+      pt.workers,
+      0::BIGINT AS n
+    FROM async.concurrency_pool_tracker pt
+    CROSS JOIN LATERAL (
+      SELECT * FROM async.task t
+      WHERE
+        pt.concurrency_pool = t.concurrency_pool
+        AND t.consumed IS NULL
         AND t.processed IS NULL
-        AND t.yielded IS NULL  
-        AND pt.workers < pt.max_workers 
+        AND t.yielded IS NULL
       ORDER BY priority, entered
-      LIMIT (SELECT g.workers * 2 FROM async.control g)
-    ) q
-  ) q
-  WHERE n <= COALESCE(
-    max_workers - workers, 
-    (SELECT default_concurrency_pool_workers FROM async.control))
+      LIMIT pt.max_workers - pt.workers
+    ) t 
+    JOIN async.target tg USING(target)
+    WHERE pt.workers < pt.max_workers 
+  ) 
+  ORDER BY priority, entered
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
+
 
 
 
@@ -965,7 +933,7 @@ DECLARE
   _bad_pools TEXT[];
 BEGIN 
   SELECT INTO g * FROM async.control;
-
+  
   IF now() > g.last_heavy_maintenance + g.heavy_maintenance_sleep
     OR g.last_heavy_maintenance IS NULL
   THEN
