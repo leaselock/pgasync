@@ -900,7 +900,7 @@ BEGIN
        * thrown from a disconnect, so they are trapped and the task is presumed
        * failed.
        */
-      PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
+      PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
       _error_message := dblink_error_message(r.name);
       PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
 
