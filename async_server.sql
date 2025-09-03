@@ -33,7 +33,10 @@ CREATE TABLE async.control
   light_maintenance_sleep INTERVAL DEFAULT '5 minutes'::INTERVAL,
   last_light_maintenance TIMESTAMPTZ,
 
-  default_concurrency_pool_workers INT DEFAULT 4
+  default_concurrency_pool_workers INT DEFAULT 4,
+
+  /* called upon async start up */
+  startup_routines TEXT[]
 
 );
 
@@ -1004,6 +1007,16 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+CREATE OR REPLACE FUNCTION async.push_startup_routine(
+  _routine TEXT) RETURNS VOID AS
+$$
+BEGIN
+  UPDATE async.control SET startup_routines = startup_routines ||
+    _routine
+  WHERE startup_routines IS NULL OR NOT _routine = any(startup_routines);
+END;
+$$ LANGUAGE PLPGSQL;
+
 
 
 CREATE OR REPLACE PROCEDURE async.acquire_mutex(
@@ -1094,6 +1107,8 @@ DECLARE
   _back_off INTERVAL DEFAULT '30 seconds';
 
   _acquired BOOL;
+
+  _routine TEXT;
 BEGIN
   SELECT INTO g * FROM async.control;
 
@@ -1147,6 +1162,13 @@ BEGIN
     consumed IS NOT NULL
     AND processed IS NULL;
 
+  /* run startup routines for user supplied cleanup */
+  FOR _routine IN SELECT unnest(g.startup_routines)
+  LOOP
+    PERFORM async.log('Running start up routine ' || _routine); 
+    EXECUTE 'CALL ' || _routine;
+  END LOOP;
+  
   /* reset worker table with a startup flag here so that the initialization to 
    * extend at runtime if needed.
    */
