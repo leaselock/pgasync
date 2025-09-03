@@ -1013,7 +1013,7 @@ $$
 BEGIN
   UPDATE async.control SET startup_routines = startup_routines ||
     _routine
-  WHERE startup_routines IS NULL OR NOT _routine = any(startup_routines);
+  WHERE _routine IS NULL OR NOT _routine = any(startup_routines);
 END;
 $$ LANGUAGE PLPGSQL;
 
