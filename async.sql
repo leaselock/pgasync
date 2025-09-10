@@ -358,3 +358,52 @@ $$
 $$ LANGUAGE SQL;
 
 
+CREATE OR REPLACE FUNCTION async.wait_for_latch() RETURNS VOID AS
+$$
+DECLARE
+  _request_latch_id BIGINT;
+  _timeout INTERVAL DEFAULT '5 minutes';
+  _ready TIMESTAMPTZ;
+  _start_time TIMESTAMPTZ;
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    PERFORM * FROM dblink(
+      async.server(), 
+      'SELECT 0 FROM async.wait_for_latch()') AS R(V INT);
+
+    RETURN;
+  END IF; 
+
+  _start_time := clock_timestamp();
+
+  SELECT INTO _request_latch_id v
+  FROM dblink(
+    (SELECT self_connection_string FROM async.control), 
+    format(
+      'INSERT INTO async.request_latch DEFAULT VALUES '
+      'RETURNING request_latch_id')) AS R(V BIGINT);
+
+  LOOP
+    SELECT ready INTO _ready
+    FROM async.request_latch WHERE request_latch_id = _request_latch_id;
+
+    IF _ready IS NOT NULL 
+    THEN 
+      EXIT;
+    END IF;
+
+    IF clock_timestamp() - _start_time > _timeout
+    THEN 
+      EXIT;
+    END IF;
+  END LOOP;
+
+  IF _ready IS NULL
+  THEN
+    RAISE EXCEPTION 'Unable to obtain client latch for latch id %',
+      _request_latch_id;
+  END IF;
+END;  
+$$ LANGUAGE PLPGSQL;
+

@@ -152,6 +152,19 @@ CREATE TABLE async.server_log
 CREATE INDEX ON async.server_log(happened);
 
 
+
+CREATE UNLOGGED TABLE async.request_latch
+(
+  request_latch_id BIGSERIAL PRIMARY KEY,
+  ready TIMESTAMPTZ
+);
+
+/* for deletions */
+CREATE INDEX ON async.request_latch((1)) WHERE ready IS NOT NULL;
+
+
+
+
 -- SELECT cron.schedule('api processor daemon', '* * * * *', 'CALL main()');
 
 \endif
@@ -968,6 +981,9 @@ BEGIN
       );
 
     UPDATE async.control SET last_light_maintenance = now();
+
+    DELETE FROM async.request_latch WHERE ready IS NOT NULL;
+
   END IF;
 END;
 $$ LANGUAGE PLPGSQL;
@@ -1017,7 +1033,21 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
-
+CREATE OR REPLACE FUNCTION async.clear_latches() RETURNS VOID AS
+$$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN 
+    UPDATE async.request_latch SET ready = now()
+    WHERE ready IS NULL
+    RETURNING request_latch_id
+  LOOP
+    PERFORM async.log(
+      format('Cleared request_latch_id %s', r.request_latch_id));
+  END LOOP;
+END;
+$$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE PROCEDURE async.acquire_mutex(
   _lock_id INT,
@@ -1149,6 +1179,9 @@ BEGIN
   /* run maintenance now as a precaution */
   PERFORM async.maintenance();
 
+  /* clear any oustanding latches */
+  DELETE FROM async.request_latch;
+
   /* attempt to acquire process lock */
   PERFORM async.log('Initializing workers');
 
@@ -1189,6 +1222,8 @@ BEGIN
 
     /* flush transaction state */
     COMMIT;
+
+    PERFORM async.clear_latches();
 
     IF _did_stuff
     THEN
