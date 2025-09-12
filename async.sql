@@ -397,6 +397,8 @@ BEGIN
     THEN 
       EXIT;
     END IF;
+
+    PERFORM pg_sleep(.000001);
   END LOOP;
 
   IF _ready IS NULL
