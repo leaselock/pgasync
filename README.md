@@ -1,13 +1,28 @@
 # pgasync: Run postgresql commands in background through dblink
 
-"Async" is a postgres extension which allows placing queries on a processing 
+pgasync is a postgres extension which allows placing queries on a processing 
 queue for deferrred execution.  This is useful for pushing work into the 
 background in a way that can be easily threaded.  This is useful for batch 
 processing as well as many other cases that come up in data processing.
 
-Async is an all SQL library, and has no required dependencies other than dblink 
+pgasync implements a daemon process (called, 'the orchestrator') in a stored 
+procedure that runs forever and relies on asynchronous dbink queries to manage 
+concurrent processing. Since dblink only requries a network socket to track 
+background query processes, scaling to a large number of concurrent tasks is 
+possible, mainly limited by having to loop and pool for finished tasks with 
+dblink_is_busy, and management of the task table.
+
+pgasync combines concepts from several different extensions and libraries such
+as pgmq and pg_backgroud. 
+
+pgasync is an all SQL library, and has no required dependencies other than dblink 
 which comes pacakged with the database.  This makes deployment very simple and 
 portable across many runtime environments such as cloud computing.
+
+pgasync is completely lock free (except for as startup mutext), pushing tasks 
+does not conflict with task execution in any way.
+
+Tasks can be directly executed queries, 
 
 ## Features:
   * Run queries in background either on hosting database or any database
