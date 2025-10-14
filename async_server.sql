@@ -982,7 +982,11 @@ BEGIN
 
     UPDATE async.control SET last_light_maintenance = now();
 
-    DELETE FROM async.request_latch WHERE ready IS NOT NULL;
+    /* clean up client latch, but not for very recently set latches so as to
+     * not race in front of the latch waiter
+     */
+    DELETE FROM async.request_latch 
+    WHERE ready IS NOT NULL and now() - ready > '5 minutes'::INTERVAL;
 
   END IF;
 END;
