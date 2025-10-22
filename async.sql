@@ -165,6 +165,7 @@ CREATE OR REPLACE FUNCTION async.finish(
 $$
 DECLARE
   _processed TIMESTAMPTZ;
+  _internal_priority INT DEFAULT -99;
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
@@ -208,7 +209,7 @@ BEGIN
       array[(
         NULL,
         self_target,
-        -1,
+        _internal_priority,
         format(
           'SELECT async.finish_internal(%s, %s::async.finish_status_t, %s, %s)',
           quote_literal(_task_ids),
@@ -305,7 +306,7 @@ BEGIN
     SELECT 
       q.task_data,
       q.target,
-      q.priority,
+      COALESCE(q.priority, 0),
       q.query,
       t.asynchronous_finish AND _run_type NOT IN('EXECUTE_NOASYNC', 'EMPTY'),
       CASE 
