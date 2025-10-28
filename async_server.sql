@@ -316,31 +316,51 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS 
-  SELECT * FROM
+  SELECT * FROM 
   (
-    SELECT 
-      t.*,
-      tg.connection_string,
-      tg.default_timeout,
-      pt.max_workers,
-      pt.workers,
-      0::BIGINT AS n
-    FROM async.concurrency_pool_tracker pt
-    CROSS JOIN LATERAL (
-      SELECT * FROM async.task t
-      WHERE
-        pt.concurrency_pool = t.concurrency_pool
-        AND t.consumed IS NULL
-        AND t.processed IS NULL
-        AND t.yielded IS NULL
-      ORDER BY priority, entered
-      LIMIT pt.max_workers - pt.workers
-    ) t 
-    JOIN async.target tg USING(target)
-    WHERE pt.workers < pt.max_workers 
-  ) 
-  ORDER BY priority, entered
-  LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
+    SELECT * FROM
+    (
+      SELECT 
+        t.*,
+        tg.connection_string,
+        tg.default_timeout,
+        pt.max_workers,
+        pt.workers,
+        0::BIGINT AS n
+      FROM async.concurrency_pool_tracker pt
+      CROSS JOIN LATERAL (
+        SELECT * FROM async.task t
+        WHERE
+          pt.concurrency_pool = t.concurrency_pool
+          AND t.consumed IS NULL
+          AND t.processed IS NULL
+          AND t.yielded IS NULL
+        ORDER BY priority, entered
+        LIMIT pt.max_workers - pt.workers
+      ) t 
+      JOIN async.target tg USING(target)
+      WHERE 
+        pt.workers < pt.max_workers 
+        AND t.target != 'async.self'
+    ) 
+    ORDER BY priority, entered
+    LIMIT (SELECT g.workers - async.active_workers() FROM async.control g)
+  )
+  UNION ALL SELECT 
+    t.*,
+    g.self_connection_string,
+    NULL,
+    NULL,
+    NULL,
+    0::BIGINT AS n
+  FROM async.task t
+  CROSS JOIN async.control g
+  WHERE 
+    t.consumed IS NULL
+    AND t.processed IS NULL
+    AND t.yielded IS NULL
+    AND t.target = 'async.self'
+  ORDER BY priority, entered;
 
 
 
