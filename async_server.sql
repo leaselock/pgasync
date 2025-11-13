@@ -316,51 +316,34 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS 
-  SELECT * FROM 
+  SELECT * FROM
   (
-    SELECT * FROM
-    (
-      SELECT 
-        t.*,
-        tg.connection_string,
-        tg.default_timeout,
-        pt.max_workers,
-        pt.workers,
-        0::BIGINT AS n
-      FROM async.concurrency_pool_tracker pt
-      CROSS JOIN LATERAL (
-        SELECT * FROM async.task t
-        WHERE
-          pt.concurrency_pool = t.concurrency_pool
-          AND t.consumed IS NULL
-          AND t.processed IS NULL
-          AND t.yielded IS NULL
-        ORDER BY priority, entered
-        LIMIT pt.max_workers - pt.workers
-      ) t 
-      JOIN async.target tg USING(target)
-      WHERE 
-        pt.workers < pt.max_workers 
-        AND t.target != 'async.self'
-    ) 
-    ORDER BY priority, entered
-    LIMIT (SELECT g.workers - async.active_workers() FROM async.control g)
-  )
-  UNION ALL SELECT 
-    t.*,
-    g.self_connection_string,
-    NULL,
-    NULL,
-    NULL,
-    0::BIGINT AS n
-  FROM async.task t
-  CROSS JOIN async.control g
-  WHERE 
-    t.consumed IS NULL
-    AND t.processed IS NULL
-    AND t.yielded IS NULL
-    AND t.target = 'async.self'
-  ORDER BY priority, entered;
+    SELECT 
+      t.*,
+      tg.connection_string,
+      tg.default_timeout,
+      pt.max_workers,
+      pt.workers,
+      0::BIGINT AS n
+    FROM async.concurrency_pool_tracker pt
+    CROSS JOIN LATERAL (
+      SELECT * FROM async.task t
+      WHERE
+        pt.concurrency_pool = t.concurrency_pool
+        AND t.consumed IS NULL
+        AND t.processed IS NULL
+        AND t.yielded IS NULL
+      ORDER BY priority, entered
+      LIMIT pt.max_workers - pt.workers
+    ) t 
+    JOIN async.target tg USING(target)
+    WHERE 
+      pt.workers < pt.max_workers 
+      AND t.target != 'async.self'
+      AND pt.concurrency_pool != 'async.self'
+  ) 
+  ORDER BY priority, entered
+  LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
 
 
@@ -505,22 +488,8 @@ BEGIN
   SELECT INTO c * FROM async.control;
 
   FOR r IN SELECT * FROM async.v_candidate_task
+    WHERE target != c.self_target
   LOOP
-    IF r.target = c.self_target
-    THEN
-      /* logging async deferrals pollutes log */
-      IF r.source != 'finish_async'
-      THEN
-        PERFORM async.log(
-          format('Running deferred task id %s via %s', r.task_id, r.source));
-
-      END IF;
-
-      did_stuff := async.run_deferred_task(r.task_id, r.query);
-
-      CONTINUE;
-    END IF;
-
     SELECT INTO w 
       *,
       CASE 
@@ -1013,15 +982,72 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+CREATE OR REPLACE FUNCTION async.run_internal() RETURNS BOOL AS
+$$
+DECLARE
+  r RECORD;
+  _did_stuff BOOL DEFAULT false;
+BEGIN
+  /* optimized path for bulk task finish */
+  FOR r IN 
+    SELECT 
+      array_agg(task_id) AS task_ids, 
+      status,
+      processing_error,
+      array_agg(deferred_task_id) AS deferred_task_ids
+    FROM 
+    (
+      SELECT 
+        deferred_task_id,
+        unnest(string_to_array(trim(both ('{}') FROM v[1]), ',')::BIGINT[]) AS task_id,
+        v[2]::async.finish_status_t AS status,
+        NULLIF(trim( both ('''') from v[3]), 'NULL') AS processing_error
+      FROM
+      (
+        SELECT 
+          t.task_id AS deferred_task_id,
+          regexp_matches(
+            query, 
+            '{(.*)}'', ''([A-Z]+).*''finish_async'', (.*)\)$') v
+          FROM async.task t
+        WHERE t.consumed IS NULL
+        AND t.processed IS NULL
+        AND t.yielded IS NULL
+        AND t.concurrency_pool = (SELECT self_target FROM async.control)
+        AND source = 'finish_async'
+      ) q
+    )
+    GROUP BY 2, 3
+  LOOP
+    UPDATE async.task SET consumed = clock_timestamp()
+    WHERE task_id = any(r.deferred_task_ids);
+
+    PERFORM async.finish_internal(
+      r.task_ids, 
+      r.status,
+      'run deferred task',
+      r.processing_error);
+
+    _did_stuff := true;
+  END LOOP;
+
+  /* XXX: handle non finished tasks (with partial index supporting */
+  RETURN _did_stuff;
+END;
+$$ LANGUAGE PLPGSQL;
+
 CREATE OR REPLACE FUNCTION async.do_work() RETURNS BOOL AS
 $$
 DECLARE
   _when TIMESTAMPTZ;
   _reap_time INTERVAL;
+  _internal_time INTERVAL;
   _run_time INTERVAL;
 
-  _debug BOOL DEFAULT false;
-  _did_stuff BOOL;
+
+  _debug BOOL DEFAULT true;
+  _did_internal BOOL;
+  _did_run BOOL;
 BEGIN
   PERFORM async.maintenance();
   
@@ -1031,18 +1057,24 @@ BEGIN
     _reap_time := clock_timestamp() - _when;
 
     _when := clock_timestamp();
-    _did_stuff := async.run_tasks();
+    _did_internal := async.run_internal();
+    _internal_time := clock_timestamp() - _when;    
+
+    _when := clock_timestamp();
+    _did_run := async.run_tasks();
     _run_time := clock_timestamp() - _when;
 
     PERFORM async.log(
       format(
-        'timing: reap: %s run: %s did_stuff = %s', 
-        _reap_time, _run_time, _did_stuff));
-    RETURN _did_stuff;
+        'timing: reap: %s internal: %s run: %s ', 
+        _reap_time, _internal_time, _run_time));
   ELSE
     PERFORM async.reap_tasks();
-    RETURN async.run_tasks();
+    _did_internal := async.run_internal();
+    _did_run := async.run_tasks();
   END IF;
+
+  RETURN _did_internal OR _did_run ;
 END;  
 $$ LANGUAGE PLPGSQL;
 
