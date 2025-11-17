@@ -725,14 +725,14 @@ DECLARE
   _finish_time TIMESTAMPTZ DEFAULT clock_timestamp();
   r RECORD;
   _disconnect BOOL;
-  _task_id_keep_connections INT[];
+  _task_id_keep_connections BIGINT[];
   _level TEXT;
   _reap_error_message TEXT;
   _failed BOOL;
   _reaping BOOL;
-BEGIN
-  --PERFORM log('DEBUG' || _task_ids::TEXT || ' ' || _status::TEXT);
 
+  _reaping_status JSONB DEFAULT '[]'::JSONB;
+BEGIN
   /* only the orchestration process is allowed to finish tasks */
   PERFORM async.check_orchestrator('finish()');
 
@@ -819,6 +819,10 @@ BEGIN
         ELSE 'FINISHED'
       END::async.finish_status_t;
 
+      _reaping_status := _reaping_status || jsonb_build_object(
+        'task_id', r.task_id,
+        'status', _status);
+
       PERFORM async.log(
         'NOTICE',
         format(
@@ -872,18 +876,32 @@ BEGIN
   WHERE task_id = ANY(_task_ids);   
 
   /* mark task complete! */
-  UPDATE async.task SET
+  UPDATE async.task t SET
     processed = CASE 
-      WHEN _status NOT IN ('YIELDED', 'PAUSED') THEN _finish_time
+      WHEN q.status NOT IN ('YIELDED', 'PAUSED') THEN _finish_time
     END,
-    yielded = CASE WHEN _status = 'YIELDED' THEN _finish_time END,
-    failed = _status IN ('FAILED', 'CANCELED', 'TIMED_OUT'),
+    yielded = CASE WHEN q.status = 'YIELDED' THEN _finish_time END,
+    failed = q.status IN ('FAILED', 'CANCELED', 'TIMED_OUT'),
     processing_error = NULLIF(_error_message, 'OK'),
     /* pause state is special; move task back into unprocessed state */
-    consumed = CASE WHEN _status != 'PAUSED' THEN consumed END,
-    finish_status = NULLIF(_status, 'PAUSED')
-  WHERE task_id = ANY(_task_ids);
-
+    consumed = CASE WHEN q.status != 'PAUSED' THEN consumed END,
+    finish_status = NULLIF(q.status, 'PAUSED')
+  FROM
+  (
+    SELECT 
+      task_id,
+      COALESCE(reap.status, _status) AS status
+    FROM unnest(_task_ids) task_id
+    LEFT JOIN 
+    (
+      SELECT
+        (j->>'task_id')::BIGINT AS task_id,
+        (j->>'status')::async.finish_status_t AS status
+      FROM jsonb_array_elements(_reaping_status) j 
+    ) reap USING(task_id)
+  ) q
+  WHERE t.task_id = q.task_id;
+  
   WITH untrack AS
   (
     /* manage concurrency pool thread count. If finished, it will bet set false,
