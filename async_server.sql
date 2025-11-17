@@ -259,6 +259,7 @@ BEGIN
   /* leaving open for hot worker recalibration */
   IF _startup
   THEN
+    PERFORM async.log('Force disconnecting existing workers');
     PERFORM async.disconnect(n, 'worker initialize')
     FROM 
     (
@@ -269,6 +270,7 @@ BEGIN
     DELETE FROM async.worker;
   END IF;
 
+  PERFORM async.log('Initializing concurrency pools');
   DELETE FROM async.concurrency_pool_tracker;
 
   PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
@@ -279,6 +281,8 @@ BEGIN
     s,
     'async.worker_' || s
   FROM generate_series(1, g.workers) s;
+
+  PERFORM async.log('Worker initialization complete');
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -326,6 +330,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
       pt.workers,
       0::BIGINT AS n
     FROM async.concurrency_pool_tracker pt
+    CROSS JOIN async.control
     CROSS JOIN LATERAL (
       SELECT * FROM async.task t
       WHERE
@@ -339,8 +344,8 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
     JOIN async.target tg USING(target)
     WHERE 
       pt.workers < pt.max_workers 
-      AND t.target != 'async.self'
-      AND pt.concurrency_pool != 'async.self'
+      AND t.target != self_target
+      AND pt.concurrency_pool != self_target
   ) 
   ORDER BY priority, entered
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
@@ -529,9 +534,13 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
           PERFORM async.log(
             'WARNING',
-            format('Got %s when attempting to recycle connection %s', 
-              SQLERRM, 
-              to_json(w)));
+            format(
+              'When attempting to run task: %s in slot: %s '
+              'for connection: %s, got %s', 
+              r.task_id,
+              w.slot,
+              to_json(w),
+              SQLERRM));
 
             w.connect_action := 'reconnect';
         END;
@@ -718,7 +727,12 @@ DECLARE
   _disconnect BOOL;
   _task_id_keep_connections INT[];
   _level TEXT;
+  _reap_error_message TEXT;
+  _failed BOOL;
+  _reaping BOOL;
 BEGIN
+  --PERFORM log('DEBUG' || _task_ids::TEXT || ' ' || _status::TEXT);
+
   /* only the orchestration process is allowed to finish tasks */
   PERFORM async.check_orchestrator('finish()');
 
@@ -729,7 +743,7 @@ BEGIN
     SELECT 1 FROM async.task t
     WHERE 
       t.task_id = _task_ids[1]
-      AND source = 'finish_async'
+      AND source = 'async.finish'
       AND _status = 'FINISHED')
   THEN
     _level := 'NOTICE';
@@ -741,8 +755,11 @@ BEGIN
         array_to_string(_task_ids, ', '),
         _context,
         _status,
-        COALESCE(' via: ' || _error_message, '')));
+        COALESCE(' via: ' || _error_message, '')))
+    WHERE _status IS NOT NULL;
   END IF;
+
+  _reaping := _status IS NULL;
 
   /* Cancel queries and disconnect as appropriate.  Any "non-success" result
    * will additionally always disconnect as a precaution.  Properly executed 
@@ -754,8 +771,9 @@ BEGIN
    * this code (for example cancelling) so we double check.
    */
   FOR r IN 
-    SELECT * 
+    SELECT w.slot, w.name, w.task_id, t.asynchronous_finish
     FROM async.worker w
+    LEFT JOIN async.task t USING(task_id)
     WHERE 
       name = ANY(dblink_get_connections()) 
       AND w.task_id = any(_task_ids)
@@ -766,6 +784,51 @@ BEGIN
      */
     CONTINUE WHEN (SELECT task_id FROM async.worker WHERE slot = r.slot)
       IS DISTINCT FROM r.task_id;
+
+    /* It's time to clear the dblink result state.
+     *
+     * The dblink API requires two get result calls for async, one to get the 
+     * result, one to reset the connection to read-ready state.  errors are 
+     * trapped there, but there are edge scenarios where an exception is 
+     * thrown from a disconnect, so they are trapped and the task is presumed
+     * failed.
+     */
+    BEGIN
+      PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
+      _reap_error_message := dblink_error_message(r.name);
+      PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
+    EXCEPTION WHEN OTHERS THEN
+      _reap_error_message := SQLERRM;
+    END;
+
+    _error_message := COALESCE(_error_message, _reap_error_message);      
+
+    /* reap tasks leaves responsibility of status to finish. */
+    IF _reaping
+    THEN
+      _failed := _reap_error_message IS DISTINCT FROM 'OK';
+
+      IF NOT _failed
+      THEN
+        _error_message := NULL;
+      END IF;
+
+      _status := CASE 
+        WHEN _failed THEN 'FAILED'
+        WHEN r.asynchronous_finish THEN 'YIELDED'
+        ELSE 'FINISHED'
+      END::async.finish_status_t;
+
+      PERFORM async.log(
+        'NOTICE',
+        format(
+          'Finishing task ids {%s} via %s with status, "%s"%s',   
+          array_to_string(array[r.task_id], ', '),
+          _context,
+          _status,
+          COALESCE(' via: ' || _error_message, '')));
+
+    END IF;
 
     /* assume we don't have to disconnect if the executed task returns 
      * normally.
@@ -807,7 +870,6 @@ BEGIN
     task_id = NULL,
     running_since = NULL
   WHERE task_id = ANY(_task_ids);   
-
 
   /* mark task complete! */
   UPDATE async.task SET
@@ -866,6 +928,7 @@ DECLARE
   r RECORD;
   _error_message TEXT;
   _failed BOOL;
+  _reap_task_ids BIGINT[];
 BEGIN
   PERFORM async.finish_internal(
     tasks,
@@ -884,47 +947,21 @@ BEGIN
   )
   WHERE array_upper(tasks, 1) >= 1;
 
-  FOR r IN 
-    SELECT 
-      w.name,
-      w.slot,
-      t.task_id,
-      t.asynchronous_finish
+  PERFORM async.finish_internal(
+    task_ids,
+    NULL::async.finish_status_t,
+    'async.reap_tasks')
+  FROM
+  (
+    SELECT array_agg(t.task_id) AS task_ids
     FROM async.worker w 
     LEFT JOIN async.task t USING(task_id)
-  WHERE 
-    w.task_id IS NOT NULL
-    AND name = any(dblink_get_connections())
-  LOOP
-    BEGIN
-      CONTINUE WHEN dblink_is_busy(r.name) = 1;
-
-      /* The dblink API requires to get result calls for async, one to get the 
-       * result, one to reset the connection to read-ready state.  errors are 
-       * trapped there, but there are edge scenarios where an exception is 
-       * thrown from a disconnect, so they are trapped and the task is presumed
-       * failed.
-       */
-      PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
-      _error_message := dblink_error_message(r.name);
-      PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
-
-    EXCEPTION WHEN OTHERS THEN
-      _error_message := SQLERRM;
-    END;
-
-    _failed := _error_message != 'OK';
-
-    PERFORM async.finish_internal(
-      array[r.task_id], 
-      CASE 
-        WHEN _failed THEN 'FAILED'
-        WHEN r.asynchronous_finish THEN 'YIELDED'
-        ELSE 'FINISHED'
-      END::async.finish_status_t,
-      'reap tasks',
-      _error_message);
-  END LOOP;
+    WHERE 
+      w.task_id IS NOT NULL
+      AND name = any(dblink_get_connections())
+      AND dblink_is_busy(w.name) != 1
+  ) q
+  WHERE array_upper(task_ids, 1) >= 1;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -993,45 +1030,52 @@ BEGIN
     SELECT 
       array_agg(task_id) AS task_ids, 
       status,
-      processing_error,
+      error_message,
       array_agg(deferred_task_id) AS deferred_task_ids
     FROM 
     (
       SELECT 
         deferred_task_id,
-        unnest(string_to_array(trim(both ('{}') FROM v[1]), ',')::BIGINT[]) AS task_id,
-        v[2]::async.finish_status_t AS status,
-        NULLIF(trim( both ('''') from v[3]), 'NULL') AS processing_error
+        status,
+        error_message,
+        unnest(task_ids) AS task_id
       FROM
       (
         SELECT 
           t.task_id AS deferred_task_id,
-          regexp_matches(
-            query, 
-            '{(.*)}'', ''([A-Z]+).*''finish_async'', (.*)\)$') v
-          FROM async.task t
+          d.*
+        FROM async.task t
+        CROSS JOIN LATERAL
+        (
+          SELECT * 
+          FROM jsonb_to_record(task_data) AS R(
+            task_ids BIGINT[],
+            status async.finish_status_t,
+            error_message TEXT)
+        ) d                 
         WHERE t.consumed IS NULL
         AND t.processed IS NULL
         AND t.yielded IS NULL
         AND t.concurrency_pool = (SELECT self_target FROM async.control)
-        AND source = 'finish_async'
       ) q
     )
     GROUP BY 2, 3
   LOOP
-    UPDATE async.task SET consumed = clock_timestamp()
+    UPDATE async.task SET 
+      consumed = now(),
+      processed = now()
     WHERE task_id = any(r.deferred_task_ids);
 
     PERFORM async.finish_internal(
       r.task_ids, 
       r.status,
       'run deferred task',
-      r.processing_error);
+      r.error_message);
 
     _did_stuff := true;
   END LOOP;
 
-  /* XXX: handle non finished tasks (with partial index supporting */
+  /* XXX: handle non finished tasks (with partial index supporting) */
   RETURN _did_stuff;
 END;
 $$ LANGUAGE PLPGSQL;
@@ -1043,9 +1087,7 @@ DECLARE
   _reap_time INTERVAL;
   _internal_time INTERVAL;
   _run_time INTERVAL;
-
-
-  _debug BOOL DEFAULT true;
+  _debug BOOL DEFAULT false;
   _did_internal BOOL;
   _did_run BOOL;
 BEGIN
@@ -1203,12 +1245,13 @@ BEGIN
   THEN
     IF NOT g.enabled
     THEN
-      PERFORM async.log('Orchestrator is enabled (see async.control). Exiting');
+      PERFORM async.log('Orchestrator is disabled (see async.control). Exiting');
     END IF;
 
     RETURN;
   END IF;
 
+  /* attempt to acquire process lock */
   CALL async.acquire_mutex(g.advisory_mutex_id, _force, _acquired);
 
   IF NOT _acquired
@@ -1238,10 +1281,10 @@ BEGIN
   /* clear any oustanding latches */
   DELETE FROM async.request_latch;
 
-  /* attempt to acquire process lock */
-  PERFORM async.log('Initializing workers');
-
   /* clear out any tasks that may have been left in running state */
+  SET LOCAL enable_seqscan TO false;
+  SET LOCAL enable_bitmapscan TO false;
+
   PERFORM async.log('Cleaning up unfinished tasks (if any)');
   UPDATE async.task SET 
     processed = now(),
@@ -1250,6 +1293,9 @@ BEGIN
   WHERE 
     consumed IS NOT NULL
     AND processed IS NULL;
+
+  SET LOCAL enable_seqscan TO DEFAULT;
+  SET LOCAL enable_bitmapscan TO DEFAULT;
 
   /* run startup routines for user supplied cleanup */
   FOR _routine IN SELECT unnest(g.startup_routines)
@@ -1261,11 +1307,13 @@ BEGIN
   /* reset worker table with a startup flag here so that the initialization to 
    * extend at runtime if needed.
    */
+  PERFORM async.log('Initializing workers');
   PERFORM async.initialize_workers(g, true);    
 
   UPDATE async.control SET 
     pid = pg_backend_pid(),
-    running_since = clock_timestamp();
+    running_since = clock_timestamp(),
+    enabled = true;
 
   PERFORM async.log('Initialization of query processor complete');    
   LOOP
@@ -1298,7 +1346,7 @@ BEGIN
           OR _last_did_stuff IS NULL
         THEN
           _show_message := false;  
-          PERFORM async.log('Nothing to do. sleeping');
+          PERFORM async.log('Nothing to do. sleeping...');
         END IF;
 
         PERFORM pg_sleep(g.busy_sleep);

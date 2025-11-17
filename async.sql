@@ -166,6 +166,7 @@ $$
 DECLARE
   _processed TIMESTAMPTZ;
   _internal_priority INT DEFAULT -99;
+  _pre_check_ids BIGINT[] DEFAULT _task_ids;
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
@@ -186,13 +187,15 @@ BEGIN
     RETURN;
   END IF;
 
-  _task_ids := async.check_task_ids(_task_ids, 'finish_async');
+  _task_ids := async.check_task_ids(_task_ids, 'async.finish');
 
   IF _task_ids IS NULL OR array_upper(_task_ids, 1) = 0
   THEN
     PERFORM async.log(
       'WARNING', 
-      'Attempt to finish null task array after check');
+      format(
+        'Attempt to finish null task array after check from %s',
+        _pre_check_ids));
     RETURN;
   END IF;  
 
@@ -202,25 +205,24 @@ BEGIN
     PERFORM async.finish_internal(
       _task_ids, 
       _status, 
-      'finish_async',
+      'async.finish',
       _error_message);  
   ELSE
     PERFORM async.push_tasks(
       array[(
-        NULL,
+        jsonb_build_object(
+          'task_ids', _task_ids,
+          'status', _status,
+          'error_message', _error_message
+        ),
         self_target,
         _internal_priority,
-        format(
-          'SELECT async.finish_internal(%s, %s::async.finish_status_t, %s, %s)',
-          quote_literal(_task_ids),
-          quote_literal(_status),
-          quote_literal('finish_async'),
-          quote_nullable(_error_message)),
+        NULL,
         NULL,
         NULL,
         NULL
       )::async.task_push_t],
-      _source := 'finish_async')
+      _source := 'async.finish')
     FROM async.control; 
   END IF;
 END;    
