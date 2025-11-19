@@ -166,7 +166,6 @@ $$
 DECLARE
   _processed TIMESTAMPTZ;
   _internal_priority INT DEFAULT -99;
-  _pre_check_ids BIGINT[] DEFAULT _task_ids;
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
@@ -180,24 +179,6 @@ BEGIN
 
     RETURN;
   END IF; 
-
-  IF _task_ids IS NULL OR array_upper(_task_ids, 1) = 0
-  THEN
-    PERFORM async.log('WARNING', 'Attempt to finish null task array');
-    RETURN;
-  END IF;
-
-  _task_ids := async.check_task_ids(_task_ids, 'async.finish');
-
-  IF _task_ids IS NULL OR array_upper(_task_ids, 1) = 0
-  THEN
-    PERFORM async.log(
-      'WARNING', 
-      format(
-        'Attempt to finish null task array after check from %s',
-        _pre_check_ids));
-    RETURN;
-  END IF;  
 
   /* is this a foreground request? If so, convert to task */
   IF pg_backend_pid() = (SELECT pid FROM async.control) 

@@ -444,7 +444,7 @@ BEGIN
       WHEN _failed THEN 'FAILED'
       ELSE 'FINISHED'
     END::async.finish_status_t,
-    'run deferred task',
+    'async.run_deferred_task',
     _error_message);
 
   did_stuff := true;
@@ -736,30 +736,20 @@ BEGIN
   /* only the orchestration process is allowed to finish tasks */
   PERFORM async.check_orchestrator('finish()');
 
-  /* cheezy check to look for deferred async tasks.
-   * they pad the logs for no value 
+  /* if coming in from the reaper (connections finishing), status is determined
+   * from the query result.
    */
-  IF NOT EXISTS (
-    SELECT 1 FROM async.task t
-    WHERE 
-      t.task_id = _task_ids[1]
-      AND source = 'async.finish'
-      AND _status = 'FINISHED')
-  THEN
-    _level := 'NOTICE';
-
-    PERFORM async.log(
-      _level,
-      format(
-        'Finishing task ids {%s} via %s with status, "%s"%s',   
-        array_to_string(_task_ids, ', '),
-        _context,
-        _status,
-        COALESCE(' via: ' || _error_message, '')))
-    WHERE _status IS NOT NULL;
-  END IF;
-
   _reaping := _status IS NULL;
+
+  /* log tasks that are fininshed in bulk with explicit status */
+  PERFORM async.log(
+    format(
+      'Finishing task ids {%s} via %s with status, "%s"%s',   
+      array_to_string(_task_ids, ', '),
+      _context,
+      _status,
+      COALESCE(' via: ' || _error_message, '')))
+  WHERE NOT _reaping;
 
   /* Cancel queries and disconnect as appropriate.  Any "non-success" result
    * will additionally always disconnect as a precaution.  Properly executed 
@@ -771,13 +761,53 @@ BEGIN
    * this code (for example cancelling) so we double check.
    */
   FOR r IN 
-    SELECT w.slot, w.name, w.task_id, t.asynchronous_finish
-    FROM async.worker w
+    SELECT 
+      w.slot, 
+      w.name, 
+      q.task_id, 
+      t.task_id IS NOT NULL AS valid_task,
+      t.asynchronous_finish,
+      t.processed IS NOT NULL AS already_finished,
+      t.finish_status = 'CANCELED' AS canceled,
+      d.name IS NOT NULL AS has_connection
+    FROM
+    (
+      SELECT unnest(_task_ids) task_id
+    ) q
     LEFT JOIN async.task t USING(task_id)
-    WHERE 
-      name = ANY(dblink_get_connections()) 
-      AND w.task_id = any(_task_ids)
+    LEFT JOIN async.worker w USING(task_id)
+    LEFT JOIN
+    (
+      SELECT unnest(dblink_get_connections()) name
+    ) d USING(name)
   LOOP
+    IF NOT r.valid_task
+    THEN
+      PERFORM async.log(
+        'WARNING',
+        format(
+          'Attempting to finish invalid task ids {%s} via %s with status, "%s"%s',   
+          r.task_id,
+          _context,
+          COALESCE(_status::TEXT, '(reaping)'),
+          COALESCE(' via: ' || _error_message, '')));
+
+      CONTINUE;
+    ELSIF r.already_finished
+    THEN
+      PERFORM async.log(
+        'WARNING',
+        format(
+          'Attempting to finish already finished task ids {%s} via %s with status, "%s"%s',   
+          r.task_id,
+          _context,
+          COALESCE(_status::TEXT, '(reaping)'),
+          COALESCE(' via: ' || _error_message, '')))
+      WHERE NOT r.canceled;
+
+      CONTINUE;
+    END IF;
+
     /* retest worker just in case something else cancelled task from earlier
      * in the loop (say, a cascaded trigger).  Verify via double checking 
      * the task_id in the worker.
@@ -793,13 +823,16 @@ BEGIN
      * thrown from a disconnect, so they are trapped and the task is presumed
      * failed.
      */
-    BEGIN
-      PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
-      _reap_error_message := dblink_error_message(r.name);
-      PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
-    EXCEPTION WHEN OTHERS THEN
-      _reap_error_message := SQLERRM;
-    END;
+    IF r.has_connection
+    THEN
+      BEGIN
+        PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
+        _reap_error_message := dblink_error_message(r.name);
+        PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
+      EXCEPTION WHEN OTHERS THEN
+        _reap_error_message := SQLERRM;
+      END;
+    END IF;
 
     _error_message := COALESCE(_error_message, _reap_error_message);      
 
@@ -831,7 +864,6 @@ BEGIN
           _context,
           _status,
           COALESCE(' via: ' || _error_message, '')));
-
     END IF;
 
     /* assume we don't have to disconnect if the executed task returns 
@@ -1087,7 +1119,7 @@ BEGIN
     PERFORM async.finish_internal(
       r.task_ids, 
       r.status,
-      'run deferred task',
+      'async.run_internal',
       r.error_message);
 
     _did_stuff := true;
