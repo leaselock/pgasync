@@ -854,7 +854,8 @@ BEGIN
 
       _reaping_status := _reaping_status || jsonb_build_object(
         'task_id', r.task_id,
-        'status', _status);
+        'status', _status,
+        'error_message', _error_message);
 
       PERFORM async.log(
         'NOTICE',
@@ -914,7 +915,7 @@ BEGIN
     END,
     yielded = CASE WHEN q.status = 'YIELDED' THEN _finish_time END,
     failed = q.status IN ('FAILED', 'CANCELED', 'TIMED_OUT'),
-    processing_error = NULLIF(_error_message, 'OK'),
+    processing_error = NULLIF(error_message, 'OK'),
     /* pause state is special; move task back into unprocessed state */
     consumed = CASE WHEN q.status != 'PAUSED' THEN consumed END,
     finish_status = NULLIF(q.status, 'PAUSED')
@@ -922,13 +923,15 @@ BEGIN
   (
     SELECT 
       task_id,
-      COALESCE(reap.status, _status) AS status
+      COALESCE(reap.status, _status) AS status,
+      COALESCE(reap.error_message, _error_message) AS error_message
     FROM unnest(_task_ids) task_id
     LEFT JOIN 
     (
       SELECT
         (j->>'task_id')::BIGINT AS task_id,
-        (j->>'status')::async.finish_status_t AS status
+        (j->>'status')::async.finish_status_t AS status,
+        (j->>'error_message') AS error_message
       FROM jsonb_array_elements(_reaping_status) j 
     ) reap USING(task_id)
   ) q
