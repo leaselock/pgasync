@@ -1021,26 +1021,46 @@ $$ LANGUAGE PLPGSQL;
 
 
 
-CREATE OR REPLACE FUNCTION async.maintenance() RETURNS VOID AS
+CREATE OR REPLACE FUNCTION async.maintenance(
+  _did_work BOOL) RETURNS VOID AS
 $$
 DECLARE
   g async.control;
   _bad_pools TEXT[];
+  _start TIMESTAMPTZ;
 BEGIN 
   SELECT INTO g * FROM async.control;
   
   IF now() > g.last_heavy_maintenance + g.heavy_maintenance_sleep
     OR g.last_heavy_maintenance IS NULL
   THEN
+    _start := clock_timestamp();
+
     PERFORM async.log('Performing heavy maintenance');
     UPDATE async.control SET last_heavy_maintenance = now();
 
     DELETE FROM async.task WHERE processed <= now() - g.task_keep_duration;
+
+    PERFORM async.log(format(
+      'Performed heavy maintenance in %s seconds',
+      round(extract('epoch' from clock_timestamp() - _start), 2)));    
+
+    _did_work := true;
   END IF;
 
-  IF now() > g.last_light_maintenance + g.light_maintenance_sleep
-    OR g.last_light_maintenance IS NULL
+  IF (now() > g.last_light_maintenance + g.light_maintenance_sleep
+    OR g.last_light_maintenance IS NULL) AND _did_work
   THEN
+    _start := clock_timestamp();
+
+    PERFORM dblink_exec(
+      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
+      'VACUUM FULL async.worker');
+
+    PERFORM dblink_exec(
+      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
+      'VACUUM FULL async.concurrency_pool_tracker');
+
     DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
       NOT EXISTS (
@@ -1067,6 +1087,9 @@ BEGIN
     DELETE FROM async.request_latch 
     WHERE ready IS NOT NULL and now() - ready > '5 minutes'::INTERVAL;
 
+    PERFORM async.log(format(
+      'Performed light maintenance in %s seconds',
+      round(extract('epoch' from clock_timestamp() - _start), 2)));
   END IF;
 END;
 $$ LANGUAGE PLPGSQL;
@@ -1144,8 +1167,6 @@ DECLARE
   _did_internal BOOL;
   _did_run BOOL;
 BEGIN
-  PERFORM async.maintenance();
-  
   IF _debug THEN
     _when := clock_timestamp();
     PERFORM async.reap_tasks();
@@ -1168,6 +1189,8 @@ BEGIN
     _did_internal := async.run_internal();
     _did_run := async.run_tasks();
   END IF;
+
+  PERFORM async.maintenance(_did_internal OR _did_run);
 
   RETURN _did_internal OR _did_run ;
 END;  
@@ -1329,7 +1352,7 @@ BEGIN
   SET statement_timeout = 0;
   
   /* run maintenance now as a precaution */
-  PERFORM async.maintenance();
+  PERFORM async.maintenance(true);
 
   /* clear any oustanding latches */
   DELETE FROM async.request_latch;
