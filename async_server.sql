@@ -1021,8 +1021,8 @@ $$ LANGUAGE PLPGSQL;
 
 
 
-CREATE OR REPLACE FUNCTION async.maintenance(
-  _did_work BOOL) RETURNS VOID AS
+CREATE OR REPLACE PROCEDURE async.maintenance(
+  _did_work BOOL) AS
 $$
 DECLARE
   g async.control;
@@ -1048,18 +1048,21 @@ BEGIN
     _did_work := true;
   END IF;
 
-  IF (now() > g.last_light_maintenance + g.light_maintenance_sleep
-    OR g.last_light_maintenance IS NULL) AND _did_work
+  IF 
+    (now() > g.last_light_maintenance + g.light_maintenance_sleep AND _did_work)
+    OR g.last_light_maintenance IS NULL
   THEN
     _start := clock_timestamp();
 
-    PERFORM dblink_exec(
-      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
-      'VACUUM FULL async.worker');
+    COMMIT;
 
     PERFORM dblink_exec(
       (SELECT connection_string FROM async.target WHERE target = g.self_target), 
-      'VACUUM FULL async.concurrency_pool_tracker');
+      'VACUUM FULL ANALYZE async.worker');
+
+    PERFORM dblink_exec(
+      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
+      'VACUUM FULL ANALYZE async.concurrency_pool_tracker');
 
     DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
@@ -1156,43 +1159,39 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
-CREATE OR REPLACE FUNCTION async.do_work() RETURNS BOOL AS
+CREATE OR REPLACE PROCEDURE async.do_work(did_work INOUT BOOL DEFAULT NULL) AS
 $$
 DECLARE
   _when TIMESTAMPTZ;
   _reap_time INTERVAL;
   _internal_time INTERVAL;
   _run_time INTERVAL;
-  _debug BOOL DEFAULT false;
   _did_internal BOOL;
   _did_run BOOL;
 BEGIN
-  IF _debug THEN
-    _when := clock_timestamp();
-    PERFORM async.reap_tasks();
-    _reap_time := clock_timestamp() - _when;
+  _when := clock_timestamp();
+  PERFORM async.reap_tasks();
+  _reap_time := clock_timestamp() - _when;
 
-    _when := clock_timestamp();
-    _did_internal := async.run_internal();
-    _internal_time := clock_timestamp() - _when;    
+  _when := clock_timestamp();
+  _did_internal := async.run_internal();
+  _internal_time := clock_timestamp() - _when;    
 
-    _when := clock_timestamp();
-    _did_run := async.run_tasks();
-    _run_time := clock_timestamp() - _when;
+  _when := clock_timestamp();
+  _did_run := async.run_tasks();
+  _run_time := clock_timestamp() - _when;
 
+  did_work := _did_internal OR _did_run;
+
+  IF did_work
+  THEN
     PERFORM async.log(
       format(
         'timing: reap: %s internal: %s run: %s ', 
         _reap_time, _internal_time, _run_time));
-  ELSE
-    PERFORM async.reap_tasks();
-    _did_internal := async.run_internal();
-    _did_run := async.run_tasks();
   END IF;
 
-  PERFORM async.maintenance(_did_internal OR _did_run);
-
-  RETURN _did_internal OR _did_run ;
+  CALL async.maintenance(did_work);
 END;  
 $$ LANGUAGE PLPGSQL;
 
@@ -1352,7 +1351,7 @@ BEGIN
   SET statement_timeout = 0;
   
   /* run maintenance now as a precaution */
-  PERFORM async.maintenance(true);
+  CALL async.maintenance(true);
 
   /* clear any oustanding latches */
   DELETE FROM async.request_latch;
@@ -1397,7 +1396,7 @@ BEGIN
 
     IF NOT g.Paused
     THEN
-      _did_stuff := async.do_work();
+      CALL async.do_work(_did_stuff);
     END IF;
 
     /* flush transaction state */
