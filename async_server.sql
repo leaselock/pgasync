@@ -4,10 +4,21 @@
  * 
  */
 
-\if :bootstrap
+DO
+$bootstrap$
+BEGIN
 
+BEGIN
+  UPDATE async.client_control SET client_only = false;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Please install client library first';
+END;
 
-UPDATE async.client_control SET client_only = false;
+BEGIN
+  PERFORM 1 FROM async.control LIMIT 0;
+  RETURN;
+EXCEPTION WHEN undefined_table THEN NULL;
+END;
 
 
 CREATE TABLE async.control
@@ -36,7 +47,10 @@ CREATE TABLE async.control
   default_concurrency_pool_workers INT DEFAULT 4,
 
   /* called upon async start up */
-  startup_routines TEXT[]
+  startup_routines TEXT[],
+
+  /* called upon on async loop */
+  loop_routines TEXT[]
 
 );
 
@@ -163,11 +177,14 @@ CREATE UNLOGGED TABLE async.request_latch
 CREATE INDEX ON async.request_latch((1)) WHERE ready IS NOT NULL;
 
 
+CREATE TYPE async.routine_type_t AS ENUM
+(
+  'STARTUP',
+  'LOOP'
+);
 
-
--- SELECT cron.schedule('api processor daemon', '* * * * *', 'CALL main()');
-
-\endif
+END;
+$bootstrap$;
 
 CREATE OR REPLACE FUNCTION async.log(
   _level TEXT,
@@ -493,7 +510,7 @@ BEGIN
   SELECT INTO c * FROM async.control;
 
   FOR r IN SELECT * FROM async.v_candidate_task
-    WHERE target != c.self_target
+    WHERE query IS NOT NULL
   LOOP
     SELECT INTO w 
       *,
@@ -630,6 +647,70 @@ BEGIN
   END LOOP;
 END;  
 $$ LANGUAGE PLPGSQL;
+
+
+CREATE OR REPLACE FUNCTION async.get_tasks_internal(
+  _target TEXT,
+  _limit INT DEFAULT 1,
+  _timeout INTERVAL DEFAULT '30 seconds',
+  task_id OUT BIGINT,
+  priority OUT INT,
+  times_up OUT TIMESTAMPTZ,
+  task_data OUT JSONB) RETURNS SETOF RECORD AS
+$$
+DECLARE
+  r RECORD;
+  c async.control;
+  _started TIMESTAMPTZ;
+  _found BOOL DEFAULT false;
+BEGIN 
+  SELECT INTO c * FROM async.control;
+
+  _started := clock_timestamp();
+
+  LOOP
+    FOR r IN SELECT * FROM async.v_candidate_task
+      WHERE 
+        target = _target
+        AND query IS NULL
+      LIMIT _limit  
+    LOOP
+      _found := true;
+
+      PERFORM async.log(
+        format(
+          'Providing task id %s to target %s pool %s', 
+          r.task_id, 
+          _target,
+          r.concurrency_pool));
+
+      RETURN QUERY WITH data AS
+      (
+        UPDATE async.task t SET 
+          consumed = clock_timestamp(),
+          times_up = now() + COALESCE(
+            manual_timeout, 
+            r.default_timeout, 
+            c.default_timeout),
+          tracked = true
+        WHERE t.task_id = r.task_id
+        RETURNING t.task_id, t.priority, t.times_up, t.task_data
+      )
+      SELECT * FROM data;
+
+      UPDATE async.concurrency_pool_tracker
+      SET workers = workers + 1
+      WHERE concurrency_pool = r.concurrency_pool;
+    END LOOP;
+
+    EXIT WHEN _found OR clock_timestamp() - _started > _timeout;
+
+    PERFORM pg_sleep(.001);
+  END LOOP;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 
 CREATE OR REPLACE FUNCTION async.check_task_ids(
   _task_ids BIGINT[],
@@ -1165,6 +1246,8 @@ DECLARE
   _when TIMESTAMPTZ;
   _reap_time INTERVAL;
   _internal_time INTERVAL;
+  _routine_time INTERVAL;
+
   _run_time INTERVAL;
   _did_internal BOOL;
   _did_run BOOL;
@@ -1183,12 +1266,16 @@ BEGIN
 
   did_work := _did_internal OR _did_run;
 
+  _when := clock_timestamp();
+  CALL async.run_routines('LOOP');
+  _routine_time := clock_timestamp() - _when;
+
   IF did_work
   THEN
     PERFORM async.log(
       format(
-        'timing: reap: %s internal: %s run: %s ', 
-        _reap_time, _internal_time, _run_time));
+        'timing: reap: %s internal: %s run: %s routine: %s', 
+        _reap_time, _internal_time, _run_time, _routine_time));
   END IF;
 
   CALL async.maintenance(did_work);
@@ -1196,15 +1283,27 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
-CREATE OR REPLACE FUNCTION async.push_startup_routine(
+CREATE OR REPLACE FUNCTION async.push_routine(
+  _routine_type async.routine_type_t,
   _routine TEXT) RETURNS VOID AS
 $$
 BEGIN
-  UPDATE async.control SET startup_routines = startup_routines ||
-    _routine
-  WHERE startup_routines IS NULL OR NOT _routine = any(startup_routines);
+  IF _routine_type = 'STARTUP'
+  THEN
+    UPDATE async.control SET startup_routines = startup_routines ||
+      _routine
+    WHERE startup_routines IS NULL OR NOT _routine = any(startup_routines);
+  ELSEIF _routine_type = 'LOOP'
+  THEN
+    UPDATE async.control SET loop_routines = loop_routines ||
+      _routine
+    WHERE loop_routines IS NULL OR NOT _routine = any(loop_routines);
+  END IF;
 END;
 $$ LANGUAGE PLPGSQL;
+
+
+
 
 CREATE OR REPLACE FUNCTION async.clear_latches() RETURNS VOID AS
 $$
@@ -1297,6 +1396,26 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE PROCEDURE async.run_routines(
+  _routine_type async.routine_type_t) AS
+$$
+DECLARE
+  _routine TEXT;
+BEGIN
+  FOR _routine IN 
+    SELECT unnest(
+      CASE _routine_type
+        WHEN 'STARTUP' THEN startup_routines
+        WHEN 'LOOP' THEN loop_routines
+      END)
+    FROM async.control
+  LOOP
+    EXECUTE 'CALL ' || _routine;
+  END LOOP;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 
 CREATE OR REPLACE PROCEDURE async.main(_force BOOL DEFAULT false) AS
 $$
@@ -1373,12 +1492,8 @@ BEGIN
   SET LOCAL enable_bitmapscan TO DEFAULT;
 
   /* run startup routines for user supplied cleanup */
-  FOR _routine IN SELECT unnest(g.startup_routines)
-  LOOP
-    PERFORM async.log('Running start up routine ' || _routine); 
-    EXECUTE 'CALL ' || _routine;
-  END LOOP;
-  
+  CALL async.run_routines('STARTUP');
+
   /* reset worker table with a startup flag here so that the initialization to 
    * extend at runtime if needed.
    */

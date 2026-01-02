@@ -1,6 +1,17 @@
-/* Install me first!! first: Client library for async libary */
 
-\if :bootstrap
+DO
+$bootstrap$
+BEGIN
+
+DO
+$$
+BEGIN
+  PERFORM 1 FROM async.client_control;
+  RETURN;
+EXCEPTION WHEN undefined_table THEN NULL;
+END;
+$$;
+
 
 CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE SCHEMA IF NOT EXISTS async;
@@ -54,7 +65,8 @@ CREATE TYPE async.task_run_type_t AS ENUM
   'EXECUTE_NOASYNC' /* run and disable the task asynchronous flag */
 );
 
-\endif
+END;
+$bootstrap$;
 
 /* getter/setter to fetch server id or update it if passed. */
 CREATE OR REPLACE FUNCTION async.server(
@@ -391,5 +403,49 @@ BEGIN
       _request_latch_id;
   END IF;
 END;  
+$$ LANGUAGE PLPGSQL;
+
+
+/* Gets tasks with no routine.  When there is no query to call, the presumption 
+ * is that the client service is managing invocation and possibly threading. 
+ * However, concurrency pool limits remain enforced.  
+ *
+ * Each task returned must be marked complete before the timeout or it will be 
+ * assumed failed.
+ *
+ * Getting tasks in this way is only possible for for asynchronous targets.  
+ * async.get_tasks can be called from multiple threads but not for the same 
+ * target.  If concurrent execution is needed, it is the client's responsibility
+ * to dispatch work to multiple threads locally and ensure that
+ * the finish function is ultimately called.
+ */
+CREATE OR REPLACE FUNCTION async.get_tasks(
+  _target TEXT,
+  _limit INT DEFAULT 1,
+  _timeout INTERVAL DEFAULT '30 seconds',
+  task_id OUT BIGINT,
+  priority OUT INT,
+  times_up OUT TIMESTAMPTZ,
+  task_data OUT JSONB) RETURNS SETOF RECORD AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    RETURN QUERY SELECT * FROM dblink(
+      async.server(), 
+      format(
+        'SELECT * FROM async.get_tasks(%s, %s)',
+        quote_literal($1),
+        quote_literal($2))) AS R(
+          task_id BIGINT,
+          priorty INT,
+          times_up TIMESTAMPTZ,
+          task_data JSONB);
+
+    RETURN;
+  END IF;
+
+  RETURN QUERY SELECT * FROM async.get_tasks_internal(_target, _limit);
+END;
 $$ LANGUAGE PLPGSQL;
 
