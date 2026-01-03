@@ -24,8 +24,7 @@ CREATE SCHEMA IF NOT EXISTS async;
 CREATE TABLE async.client_control
 (
   client_only BOOL DEFAULT TRUE,
-  connection_string TEXT DEFAULT '',
-  version TEXT DEFAULT '1.0'
+  connection_string TEXT DEFAULT ''
 );
 
 CREATE UNIQUE INDEX ON async.client_control((1));
@@ -73,6 +72,7 @@ CREATE TYPE async.task_run_type_t AS ENUM
 
 END;
 $bootstrap$;
+
 
 DO
 $code$

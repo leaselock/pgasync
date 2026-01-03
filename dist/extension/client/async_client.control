@@ -1,0 +1,4 @@
+comment = 'Client library for async automation framework'
+default_version = '1.0'
+module_pathname = '$libdir/async_client'
+relocatable = true
