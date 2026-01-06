@@ -10,14 +10,12 @@ THEN
   RAISE EXCEPTION 'dblink extension must be installed before installing async';
 END IF;
 
-DO
-$$
 BEGIN
   PERFORM 1 FROM async.client_control;
   RETURN;
 EXCEPTION WHEN undefined_table THEN NULL;
 END;
-$$;
+
 
 CREATE SCHEMA IF NOT EXISTS async;
 
