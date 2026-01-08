@@ -344,28 +344,6 @@ $$
 $$ LANGUAGE SQL STABLE;
 
 
-CREATE OR REPLACE FUNCTION async.candidate_tasks() RETURNS SETOF async.task AS
-$$
-DECLARE
-  r RECORD;
-BEGIN
-  FOR r IN 
-    SELECT *
-    FROM async.v_target 
-    WHERE max_concurrency - active_workers > 0
-  LOOP
-    RETURN QUERY SELECT * 
-    FROM async.task t
-    WHERE 
-      consumed IS NULL
-      AND processed IS NULL
-      AND t.yielded IS NULL
-      AND t.target = r.target
-    ORDER BY t.priority, t.entered
-    LIMIT r.max_concurrency - r.active_workers;
-  END LOOP;
-END;
-$$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS 
   SELECT * FROM
