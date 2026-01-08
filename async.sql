@@ -16,7 +16,6 @@ BEGIN
 EXCEPTION WHEN undefined_table THEN NULL;
 END;
 
-
 CREATE SCHEMA IF NOT EXISTS async;
 
 CREATE TABLE async.client_control
@@ -45,7 +44,8 @@ CREATE TYPE async.finish_status_t AS ENUM(
   'PAUSED', /* will cancel task, but reset for processing */
   'TIMED_OUT', /* ran out of time */
   'YIELDED', /* pending asynchronous task */
-  'DOA'); /* dead on arrival, basically, a NOP */
+  'DOA', /* dead on arrival, basically, a NOP */
+  'DEFERRED'); /* paused for a period of time */
 
 
 /* Defines task so that it can be pushed */
@@ -188,7 +188,8 @@ $$ LANGUAGE PLPGSQL;
 CREATE OR REPLACE FUNCTION async.finish(
   _task_ids BIGINT[],
   _status async.finish_status_t,
-  _error_message TEXT) RETURNS VOID AS
+  _error_message TEXT,
+  _duration INTERVAL) RETURNS VOID AS
 $$
 DECLARE
   _processed TIMESTAMPTZ;
@@ -199,10 +200,11 @@ BEGIN
     PERFORM * FROM dblink(
       async.server(), 
       format(
-        'SELECT 0 FROM async.finish(%s, %s, %s)',
+        'SELECT 0 FROM async.finish(%s, %s, %s, %s)',
         quote_literal($1),
         quote_literal($2),
-        quote_nullable($3))) AS R(V INT);
+        quote_nullable($3),
+        quote_nullable($4))) AS R(V INT);
 
     RETURN;
   END IF; 
@@ -214,14 +216,16 @@ BEGIN
       _task_ids, 
       _status, 
       'async.finish',
-      _error_message);  
+      _error_message,
+      _duration);  
   ELSE
     PERFORM async.push_tasks(
       array[(
         jsonb_build_object(
           'task_ids', _task_ids,
           'status', _status,
-          'error_message', _error_message
+          'error_message', _error_message,
+          'duration', _duration
         ),
         self_target,
         _internal_priority,
@@ -235,6 +239,21 @@ BEGIN
   END IF;
 END;    
 $$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION async.finish(
+  _task_ids BIGINT[],
+  _status async.finish_status_t,
+  _error_message TEXT) RETURNS VOID AS
+$$
+  SELECT async.finish($1, $2, $3, null);
+$$ LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION async.defer(
+  _task_ids BIGINT[],
+  _duration INTERVAL) RETURNS VOID AS
+$$
+  SELECT async.finish($1, 'DEFERRED', NULL, $2);
+$$ LANGUAGE SQL;
 
 
 /* wrapper to finish to cancel tasks */
