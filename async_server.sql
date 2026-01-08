@@ -364,7 +364,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
         AND t.consumed IS NULL
         AND t.processed IS NULL
         AND t.yielded IS NULL
-        AND (eligible_when IS NULL OR eligible_when >= now())
+        AND (eligible_when IS NULL OR eligible_when <= now())
       ORDER BY priority, entered
       LIMIT pt.max_workers - pt.workers
     ) t 
