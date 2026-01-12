@@ -25,7 +25,7 @@ CREATE TABLE async.control
 (
   enabled BOOL DEFAULT true,
   workers INT DEFAULT 20,
-  idle_sleep FLOAT8 DEFAULT 1.0,
+  idle_sleep FLOAT8 DEFAULT 0.1,
   heavy_maintenance_sleep INTERVAL DEFAULT '24 hours'::INTERVAL,
   task_keep_duration INTERVAL DEFAULT '30 days'::INTERVAL,
   default_timeout INTERVAL DEFAULT '1 hour'::INTERVAL,
@@ -39,7 +39,7 @@ CREATE TABLE async.control
   running_since TIMESTAMPTZ,
   paused BOOL NOT NULL DEFAULT false,
   pid INT, /* pid of main background process */
-  busy_sleep FLOAT8 DEFAULT 0.1,
+  busy_sleep FLOAT8 DEFAULT 0.01,
 
   light_maintenance_sleep INTERVAL DEFAULT '5 minutes'::INTERVAL,
   last_light_maintenance TIMESTAMPTZ,
@@ -54,7 +54,7 @@ CREATE TABLE async.control
 
   version TEXT DEFAULT '1.0',
 
-  debug_log BOOL DEFAULT false
+  debug_log BOOL DEFAULT true
 
 );
 
@@ -117,12 +117,6 @@ CREATE TABLE async.task
 );
 
 /* supports fetching eligible tasks */
-CREATE INDEX ON async.task(priority, entered) 
-WHERE 
-  consumed IS NULL
-  AND yielded IS NULL
-  AND processed IS NULL;
-
 CREATE INDEX ON async.task(concurrency_pool, priority, entered) 
 WHERE 
   consumed IS NULL
@@ -130,8 +124,12 @@ WHERE
   AND processed IS NULL;  
 
 CREATE INDEX ON async.task(times_up)
-  WHERE processed IS NULL; 
-    
+  WHERE 
+    processed IS NULL
+    /* postgres strangely picks this index when it should not, so force an
+     * unusual qual so that it is ineligible for standard queries
+     */
+    AND concurrency_pool IS NOT NULL; 
 
 
 CREATE UNLOGGED TABLE async.worker
@@ -790,7 +788,7 @@ DECLARE
   _reaping BOOL;
 
   _reaping_status JSONB DEFAULT '[]'::JSONB;
-BEGIN
+BEGIN 
   /* only the orchestration process is allowed to finish tasks */
   PERFORM async.check_orchestrator('finish()');
 
@@ -929,7 +927,7 @@ BEGIN
     /* assume we don't have to disconnect if the executed task returns 
      * normally.
      */
-    _disconnect := _status NOT IN('FINISHED', 'YIELDED');
+    _disconnect := _status NOT IN('FINISHED', 'YIELDED', 'DEFERRED');
 
     /* dblink can raise spurious erorrs during various network induced edge 
      * cases...if so capture them and blend message into the task error.  
@@ -1000,10 +998,16 @@ BEGIN
   WITH untrack AS
   (
     /* manage concurrency pool thread count. If finished, it will bet set false,
-     * but if yielded, it will be set null to revert to original state.
+     * reducing the tracker.
+     *
+     * Yielded task will reduce tracker if configured to do so.  Deferred
+     * tasks will reduce tracker.
      */
     UPDATE async.task t SET
-      tracked = CASE WHEN processed IS NOT NULL THEN false END
+      tracked = CASE 
+        WHEN processed IS NOT NULL THEN false
+        WHEN finish_status = 'DEFERRED' THEN false 
+      END
     WHERE 
       task_id = any(_task_ids)
       AND tracked
@@ -1012,7 +1016,8 @@ BEGIN
         OR (
           yielded IS NOT NULL
           AND NOT COALESCE(track_yielded, false)
-        ) 
+        )
+        OR finish_status = 'DEFERRED'
       )
     RETURNING t.concurrency_pool   
   ) 
@@ -1056,7 +1061,7 @@ BEGIN
     WHERE 
       processed IS NULL
       /* making extra extra sure partial index is utilized */
-      AND times_up IS NOT NULL
+      AND concurrency_pool IS NOT NULL
       AND times_up < now()
   )
   WHERE array_upper(tasks, 1) >= 1;
@@ -1136,6 +1141,7 @@ BEGIN
         SELECT 1 FROM async.task t
         WHERE 
           t.processed IS NULL
+          AND t.concurrency_pool IS NOT NULL
           AND t.concurrency_pool = cpt.concurrency_pool
       )
       AND
@@ -1245,12 +1251,12 @@ DECLARE
 BEGIN
   _when := clock_timestamp();
 
-  PERFORM async.reap_tasks();
-  _reap_time := clock_timestamp() - _when;
+  _did_internal := async.run_internal();
+  _internal_time := clock_timestamp() - _when;
 
   _when := clock_timestamp();
-  _did_internal := async.run_internal();
-  _internal_time := clock_timestamp() - _when;    
+  PERFORM async.reap_tasks();
+  _reap_time := clock_timestamp() - _when;    
 
   _when := clock_timestamp();
   _did_run := async.run_tasks();
@@ -1417,19 +1423,74 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
-
-CREATE OR REPLACE PROCEDURE async.main(_force BOOL DEFAULT false) AS
+CREATE OR REPLACE PROCEDURE async.cycle(
+  _last_did_stuff INOUT TIMESTAMPTZ DEFAULT NULL,
+  _show_message INOUT BOOL DEFAULT NULL) AS
 $$
-DECLARE 
+DECLARE
   g async.control;
-  _show_message BOOL DEFAULT TRUE;
 
   _did_stuff BOOL DEFAULT FALSE;
 
-  _last_did_stuff TIMESTAMPTZ;
-  _back_off INTERVAL DEFAULT '30 seconds';
+  _back_off INTERVAL DEFAULT '30 seconds';  
+BEGIN
+  SELECT INTO g * FROM async.control;
+
+  IF NOT g.Paused
+  THEN
+    CALL async.do_work(_did_stuff);
+    PERFORM async.clear_latches();
+
+    IF _last_did_stuff IS NULL
+    THEN 
+      RETURN;
+    END IF;
+  END IF;
+
+  /* flush transaction state */
+  COMMIT;
+
+  CALL async.maintenance(_did_stuff);
+
+  IF _did_stuff
+  THEN
+    _show_message := true;
+    _last_did_stuff := clock_timestamp();
+  ELSE
+    IF NOT g.enabled
+    THEN
+      RETURN;
+    END IF;    
+
+    /* wait a little bit before showing message, and be aggressive */      
+    IF _show_message 
+    THEN
+      IF clock_timestamp() - _last_did_stuff > _back_off  
+        OR _last_did_stuff IS NULL
+      THEN
+        _show_message := false;  
+        PERFORM async.log('Nothing to do. sleeping...');
+      END IF;
+
+      PERFORM pg_sleep(g.busy_sleep);
+    ELSE
+      PERFORM pg_sleep(g.idle_sleep);  
+    END IF;
+  END IF;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+CREATE OR REPLACE PROCEDURE async.main(
+  _force BOOL DEFAULT false,
+  _manual_mode BOOL DEFAULT false) AS
+$$
+DECLARE 
+  g async.control;
 
   _acquired BOOL;
+  _last_did_stuff TIMESTAMPTZ DEFAULT now();
+  _show_message BOOL DEFAULT true;
 
   _routine TEXT;
 BEGIN
@@ -1507,45 +1568,15 @@ BEGIN
     enabled = true;
 
   PERFORM async.log('Initialization of query processor complete');    
+
+  IF _manual_mode
+  THEN
+    PERFORM async.log('Entering manual mode (CALL async.cycle() to iterate)');    
+    RETURN;
+  END IF;
+
   LOOP
-    SELECT INTO g * FROM async.control;
-
-    IF NOT g.Paused
-    THEN
-      CALL async.do_work(_did_stuff);
-    END IF;
-
-    /* flush transaction state */
-    COMMIT;
-
-    PERFORM async.clear_latches();
-    CALL async.maintenance(_did_stuff);
-
-    IF _did_stuff
-    THEN
-      _show_message := true;
-      _last_did_stuff := clock_timestamp();
-    ELSE
-      IF NOT g.enabled
-      THEN
-        RETURN;
-      END IF;    
- 
-      /* wait a little bit before showing message, and be aggressive */      
-      IF _show_message 
-      THEN
-        IF clock_timestamp() - _last_did_stuff > _back_off  
-          OR _last_did_stuff IS NULL
-        THEN
-          _show_message := false;  
-          PERFORM async.log('Nothing to do. sleeping...');
-        END IF;
-
-        PERFORM pg_sleep(g.busy_sleep);
-      ELSE
-        PERFORM pg_sleep(g.idle_sleep);  
-      END IF;
-    END IF;
+    CALL async.cycle(_last_did_stuff, _show_message);
   END LOOP;  
 END;
 $$ LANGUAGE PLPGSQL;

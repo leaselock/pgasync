@@ -253,6 +253,7 @@ CREATE OR REPLACE FUNCTION async.defer(
   _duration INTERVAL) RETURNS VOID AS
 $$
   SELECT async.finish($1, 'DEFERRED', NULL, $2);
+  SELECT async.wait_for_latch();
 $$ LANGUAGE SQL;
 
 

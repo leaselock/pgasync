@@ -55,13 +55,14 @@ CREATE OR REPLACE VIEW async.v_concurrency_pool_info AS
   ORDER BY lower(cp.concurrency_pool);  
 
 
-CREATE OR REPLACE FUNCTION async.tail(
+CREATE OR REPLACE FUNCTION async.tail_once(
   _server_log_id BIGINT DEFAULT NULL,
-  _notify BOOL DEFAULT true,
+  _grep TEXT DEFAULT NULL,
   _limit INT DEFAULT 1000) RETURNS SETOF async.server_log AS
 $$
 DECLARE
   l async.server_log;
+  _pre_fetch_rows INT DEFAULT 100;
 BEGIN
   _server_log_id := COALESCE(
     _server_log_id, 
@@ -72,35 +73,49 @@ BEGIN
         SELECT server_log 
         FROM async.server_log
         ORDER BY server_log DESC
-        LIMIT _limit
+        LIMIT _pre_fetch_rows
       ) q
     ));
 
-  IF _notify
-  THEN
-    LOOP
-      SELECT INTO l * 
-      FROM async.server_log 
-      WHERE server_log > _server_log_id
-      ORDER BY server_log LIMIT 1;
-
-      IF FOUND
-      THEN
-        RAISE NOTICE '%', l.message;
-        _server_log_id = l.server_log;
-      ELSE
-        PERFORM pg_sleep(.1);
-      END IF;
-    END LOOP;
-  ELSE
-    RETURN QUERY SELECT * 
-      FROM async.server_log 
-      WHERE server_log > _server_log_id
-      ORDER BY server_log LIMIT _limit;  
-  END IF;
+  RETURN QUERY SELECT * 
+    FROM async.server_log 
+    WHERE 
+      server_log > _server_log_id
+      AND (_grep IS NULL OR message LIKE '%' || _grep || '%')
+    ORDER BY server_log LIMIT _limit;  
 END;
 $$ LANGUAGE PLPGSQL;
 
 
+CREATE OR REPLACE PROCEDURE async.tail(
+  _grep TEXT DEFAULT NULL,
+  _limit INT DEFAULT 1000) AS
+$$
+DECLARE
+  l RECORD;
+  _server_log_id BIGINT;
+  _found BOOL;
+BEGIN
+  LOOP
+    FOR l IN 
+      SELECT * 
+      FROM async.tail_once(_server_log_id, _grep, _limit)
+    LOOP
+      _found := true;
+      RAISE NOTICE '[%]: %', l.server_log, l.message;
 
+      _server_log_id := l.server_log;
+    END LOOP;
+
+    IF NOT _found 
+    THEN
+      PERFORM pg_sleep(.1);
+    END IF;
+
+    COMMIT;
+
+    _found := false;
+  END LOOP;
+END;
+$$ LANGUAGE PLPGSQL;
 
