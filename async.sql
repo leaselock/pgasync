@@ -484,5 +484,31 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE FUNCTION async.restart_task(
+  _task_id BIGINT) RETURNS VOID AS
+$$
+DECLARE
+  _pool TEXT;
+BEGIN
+  UPDATE async.task SET 
+    processed = NULL,
+    yielded = NULL,
+    consumed = NULL,
+    eligible_when = NULL,
+    finish_status = NULL,
+    source = 'async.restart_task',
+    processing_error = NULL,
+    tracked = false,
+    times_up = NULL
+  WHERE 
+    task_id = _task_id
+    AND processed IS NOT NULL
+  RETURNING concurrency_pool INTO _pool;
+
+  PERFORM async.set_concurrency_pool_tracker(array[_pool]);
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 END;
 $code$;
