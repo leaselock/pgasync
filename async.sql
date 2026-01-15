@@ -252,9 +252,11 @@ CREATE OR REPLACE FUNCTION async.defer(
   _task_ids BIGINT[],
   _duration INTERVAL) RETURNS VOID AS
 $$
-  SELECT async.finish($1, 'DEFERRED', NULL, $2);
-  SELECT async.wait_for_latch();
-$$ LANGUAGE SQL;
+BEGIN
+  PERFORM async.finish($1, 'DEFERRED', NULL, $2);
+  PERFORM async.wait_for_latch();
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 /* wrapper to finish to cancel tasks */
@@ -262,8 +264,10 @@ CREATE OR REPLACE FUNCTION async.cancel(
   _task_ids BIGINT[],
   _error_message TEXT DEFAULT 'manual cancel') RETURNS VOID AS
 $$
-  SELECT async.finish($1, 'CANCELED', _error_message);
-$$ LANGUAGE SQL;
+BEGIN
+  PERFORM async.finish($1, 'CANCELED', _error_message);
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 /* helper function to build task_push_t with arguments defaulted */
