@@ -321,7 +321,9 @@ BEGIN
 
   PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
   FROM async.task
-  WHERE processed IS NULL;
+  WHERE 
+    processed IS NULL
+    AND concurrency_pool IS NOT NULL;
 
   INSERT INTO async.worker SELECT 
     s,
@@ -1087,6 +1089,53 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+CREATE OR REPLACE FUNCTION async.query_with_timeout(
+  _query TEXT, 
+  _timeout INTERVAL DEFAULT '30 seconds'::INTERVAL,
+  _connection_name TEXT DEFAULT 'async.query_with_timeout',
+  _connection_string TEXT DEFAULT NULL,
+  response OUT TEXT,
+  failed OUT BOOL) RETURNS RECORD AS
+$$
+DECLARE
+  _return TEXT;
+  _query_start TIMESTAMPTZ DEFAULT clock_timestamp();
+  g async.control;
+BEGIN
+  SELECT INTO g * FROM async.control;
+
+  _connection_string := COALESCE(_connection_string,
+    (SELECT connection_string FROM async.target WHERE target = g.self_target));
+
+  PERFORM dblink_connect(
+    _connection_name,
+    _connection_string);
+
+  PERFORM dblink_send_query(_connection_name, _query);
+
+  LOOP
+    EXIT WHEN dblink_is_busy(_connection_name) = 0 
+      OR clock_timestamp() - _query_start > _timeout;
+    PERFORM pg_sleep(0.001);
+  END LOOP;
+
+  IF dblink_is_busy(_connection_name) = 0
+  THEN
+    failed := false;
+    PERFORM * FROM dblink_get_result(_connection_name, false) AS R(v TEXT);
+    response := dblink_error_message(_connection_name);
+    PERFORM * FROM dblink_get_result(_connection_name) AS R(v TEXT);  
+  ELSE
+    failed := true;
+    response := 'Timeout exceeded';
+
+    PERFORM dblink_cancel_query(_connection_name);
+  END IF;
+
+  PERFORM dblink_disconnect(_connection_name);
+END;
+$$ LANGUAGE PLPGSQL;
+
 
 
 CREATE OR REPLACE PROCEDURE async.maintenance(
@@ -1127,13 +1176,23 @@ BEGIN
     /* be very tight on vacuuming worker and pool tracking tables...they are
      * hit hard and slower scan times can really hurt overall performance.
      */
-    PERFORM dblink_exec(
-      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
-      'VACUUM FULL ANALYZE async.worker');
+    IF (async.query_with_timeout(
+      'VACUUM FULL async.worker',
+      '5 seconds')).failed
+    THEN
+      PERFORM async.log(
+        'WARNING',
+        'Timeout exceeded when vaccuming async.worker');
+    END IF;
 
-    PERFORM dblink_exec(
-      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
-      'VACUUM FULL ANALYZE async.concurrency_pool_tracker');
+    IF (async.query_with_timeout(
+      'VACUUM FULL async.concurrency_pool_tracker',
+      '5 seconds')).failed
+    THEN
+      PERFORM async.log(
+        'WARNING',
+        'Timeout exceeded when vaccuming async.concurrency_pool_tracker');
+    END IF;
 
     DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
@@ -1548,7 +1607,8 @@ BEGIN
     processing_error = 'presumed failed due to async startup'
   WHERE 
     consumed IS NOT NULL
-    AND processed IS NULL;
+    AND processed IS NULL
+    AND concurrency_pool IS NOT NULL;
 
   SET LOCAL enable_seqscan TO DEFAULT;
   SET LOCAL enable_bitmapscan TO DEFAULT;

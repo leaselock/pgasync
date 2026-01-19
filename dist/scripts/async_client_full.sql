@@ -252,8 +252,11 @@ CREATE OR REPLACE FUNCTION async.defer(
   _task_ids BIGINT[],
   _duration INTERVAL) RETURNS VOID AS
 $$
-  SELECT async.finish($1, 'DEFERRED', NULL, $2);
-$$ LANGUAGE SQL;
+BEGIN
+  PERFORM async.finish($1, 'DEFERRED', NULL, $2);
+  PERFORM async.wait_for_latch();
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 /* wrapper to finish to cancel tasks */
@@ -261,8 +264,10 @@ CREATE OR REPLACE FUNCTION async.cancel(
   _task_ids BIGINT[],
   _error_message TEXT DEFAULT 'manual cancel') RETURNS VOID AS
 $$
-  SELECT async.finish($1, 'CANCELED', _error_message);
-$$ LANGUAGE SQL;
+BEGIN
+  PERFORM async.finish($1, 'CANCELED', _error_message);
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 /* helper function to build task_push_t with arguments defaulted */
@@ -482,6 +487,32 @@ BEGIN
   RETURN QUERY SELECT * FROM async.get_tasks_internal(_target, _limit);
 END;
 $$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION async.restart_task(
+  _task_id BIGINT) RETURNS VOID AS
+$$
+DECLARE
+  _pool TEXT;
+BEGIN
+  UPDATE async.task SET 
+    processed = NULL,
+    yielded = NULL,
+    consumed = NULL,
+    eligible_when = NULL,
+    finish_status = NULL,
+    source = 'async.restart_task',
+    processing_error = NULL,
+    tracked = false,
+    times_up = NULL
+  WHERE 
+    task_id = _task_id
+    AND processed IS NOT NULL
+  RETURNING concurrency_pool INTO _pool;
+
+  PERFORM async.set_concurrency_pool_tracker(array[_pool]);
+END;
+$$ LANGUAGE PLPGSQL;
+
 
 END;
 $code$;

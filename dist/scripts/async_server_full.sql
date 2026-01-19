@@ -252,8 +252,11 @@ CREATE OR REPLACE FUNCTION async.defer(
   _task_ids BIGINT[],
   _duration INTERVAL) RETURNS VOID AS
 $$
-  SELECT async.finish($1, 'DEFERRED', NULL, $2);
-$$ LANGUAGE SQL;
+BEGIN
+  PERFORM async.finish($1, 'DEFERRED', NULL, $2);
+  PERFORM async.wait_for_latch();
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 /* wrapper to finish to cancel tasks */
@@ -261,8 +264,10 @@ CREATE OR REPLACE FUNCTION async.cancel(
   _task_ids BIGINT[],
   _error_message TEXT DEFAULT 'manual cancel') RETURNS VOID AS
 $$
-  SELECT async.finish($1, 'CANCELED', _error_message);
-$$ LANGUAGE SQL;
+BEGIN
+  PERFORM async.finish($1, 'CANCELED', _error_message);
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 /* helper function to build task_push_t with arguments defaulted */
@@ -483,6 +488,32 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE FUNCTION async.restart_task(
+  _task_id BIGINT) RETURNS VOID AS
+$$
+DECLARE
+  _pool TEXT;
+BEGIN
+  UPDATE async.task SET 
+    processed = NULL,
+    yielded = NULL,
+    consumed = NULL,
+    eligible_when = NULL,
+    finish_status = NULL,
+    source = 'async.restart_task',
+    processing_error = NULL,
+    tracked = false,
+    times_up = NULL
+  WHERE 
+    task_id = _task_id
+    AND processed IS NOT NULL
+  RETURNING concurrency_pool INTO _pool;
+
+  PERFORM async.set_concurrency_pool_tracker(array[_pool]);
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 END;
 $code$;
 /* Standard routines and structures for asynchronous processing.   Intended
@@ -512,7 +543,7 @@ CREATE TABLE async.control
 (
   enabled BOOL DEFAULT true,
   workers INT DEFAULT 20,
-  idle_sleep FLOAT8 DEFAULT 1.0,
+  idle_sleep FLOAT8 DEFAULT 0.1,
   heavy_maintenance_sleep INTERVAL DEFAULT '24 hours'::INTERVAL,
   task_keep_duration INTERVAL DEFAULT '30 days'::INTERVAL,
   default_timeout INTERVAL DEFAULT '1 hour'::INTERVAL,
@@ -526,7 +557,7 @@ CREATE TABLE async.control
   running_since TIMESTAMPTZ,
   paused BOOL NOT NULL DEFAULT false,
   pid INT, /* pid of main background process */
-  busy_sleep FLOAT8 DEFAULT 0.1,
+  busy_sleep FLOAT8 DEFAULT 0.01,
 
   light_maintenance_sleep INTERVAL DEFAULT '5 minutes'::INTERVAL,
   last_light_maintenance TIMESTAMPTZ,
@@ -541,7 +572,7 @@ CREATE TABLE async.control
 
   version TEXT DEFAULT '1.0',
 
-  debug_log BOOL DEFAULT false
+  debug_log BOOL DEFAULT true
 
 );
 
@@ -604,12 +635,6 @@ CREATE TABLE async.task
 );
 
 /* supports fetching eligible tasks */
-CREATE INDEX ON async.task(priority, entered) 
-WHERE 
-  consumed IS NULL
-  AND yielded IS NULL
-  AND processed IS NULL;
-
 CREATE INDEX ON async.task(concurrency_pool, priority, entered) 
 WHERE 
   consumed IS NULL
@@ -617,8 +642,12 @@ WHERE
   AND processed IS NULL;  
 
 CREATE INDEX ON async.task(times_up)
-  WHERE processed IS NULL; 
-    
+  WHERE 
+    processed IS NULL
+    /* postgres strangely picks this index when it should not, so force an
+     * unusual qual so that it is ineligible for standard queries
+     */
+    AND concurrency_pool IS NOT NULL; 
 
 
 CREATE UNLOGGED TABLE async.worker
@@ -810,7 +839,9 @@ BEGIN
 
   PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
   FROM async.task
-  WHERE processed IS NULL;
+  WHERE 
+    processed IS NULL
+    AND concurrency_pool IS NOT NULL;
 
   INSERT INTO async.worker SELECT 
     s,
@@ -851,7 +882,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
         AND t.consumed IS NULL
         AND t.processed IS NULL
         AND t.yielded IS NULL
-        AND (eligible_when IS NULL OR eligible_when >= now())
+        AND (eligible_when IS NULL OR eligible_when <= now())
       ORDER BY priority, entered
       LIMIT pt.max_workers - pt.workers
     ) t 
@@ -1277,7 +1308,7 @@ DECLARE
   _reaping BOOL;
 
   _reaping_status JSONB DEFAULT '[]'::JSONB;
-BEGIN
+BEGIN 
   /* only the orchestration process is allowed to finish tasks */
   PERFORM async.check_orchestrator('finish()');
 
@@ -1416,7 +1447,7 @@ BEGIN
     /* assume we don't have to disconnect if the executed task returns 
      * normally.
      */
-    _disconnect := _status NOT IN('FINISHED', 'YIELDED');
+    _disconnect := _status NOT IN('FINISHED', 'YIELDED', 'DEFERRED');
 
     /* dblink can raise spurious erorrs during various network induced edge 
      * cases...if so capture them and blend message into the task error.  
@@ -1487,10 +1518,16 @@ BEGIN
   WITH untrack AS
   (
     /* manage concurrency pool thread count. If finished, it will bet set false,
-     * but if yielded, it will be set null to revert to original state.
+     * reducing the tracker.
+     *
+     * Yielded task will reduce tracker if configured to do so.  Deferred
+     * tasks will reduce tracker.
      */
     UPDATE async.task t SET
-      tracked = CASE WHEN processed IS NOT NULL THEN false END
+      tracked = CASE 
+        WHEN processed IS NOT NULL THEN false
+        WHEN finish_status = 'DEFERRED' THEN false 
+      END
     WHERE 
       task_id = any(_task_ids)
       AND tracked
@@ -1499,7 +1536,8 @@ BEGIN
         OR (
           yielded IS NOT NULL
           AND NOT COALESCE(track_yielded, false)
-        ) 
+        )
+        OR finish_status = 'DEFERRED'
       )
     RETURNING t.concurrency_pool   
   ) 
@@ -1543,7 +1581,7 @@ BEGIN
     WHERE 
       processed IS NULL
       /* making extra extra sure partial index is utilized */
-      AND times_up IS NOT NULL
+      AND concurrency_pool IS NOT NULL
       AND times_up < now()
   )
   WHERE array_upper(tasks, 1) >= 1;
@@ -1568,6 +1606,53 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+
+CREATE OR REPLACE FUNCTION async.query_with_timeout(
+  _query TEXT, 
+  _timeout INTERVAL DEFAULT '30 seconds'::INTERVAL,
+  _connection_name TEXT DEFAULT 'async.query_with_timeout',
+  _connection_string TEXT DEFAULT NULL,
+  response OUT TEXT,
+  failed OUT BOOL) RETURNS RECORD AS
+$$
+DECLARE
+  _return TEXT;
+  _query_start TIMESTAMPTZ DEFAULT clock_timestamp();
+  g async.control;
+BEGIN
+  SELECT INTO g * FROM async.control;
+
+  _connection_string := COALESCE(_connection_string,
+    (SELECT connection_string FROM async.target WHERE target = g.self_target));
+
+  PERFORM dblink_connect(
+    _connection_name,
+    _connection_string);
+
+  PERFORM dblink_send_query(_connection_name, _query);
+
+  LOOP
+    EXIT WHEN dblink_is_busy(_connection_name) = 0 
+      OR clock_timestamp() - _query_start > _timeout;
+    PERFORM pg_sleep(0.001);
+  END LOOP;
+
+  IF dblink_is_busy(_connection_name) = 0
+  THEN
+    failed := false;
+    PERFORM * FROM dblink_get_result(_connection_name, false) AS R(v TEXT);
+    response := dblink_error_message(_connection_name);
+    PERFORM * FROM dblink_get_result(_connection_name) AS R(v TEXT);  
+  ELSE
+    failed := true;
+    response := 'Timeout exceeded';
+
+    PERFORM dblink_cancel_query(_connection_name);
+  END IF;
+
+  PERFORM dblink_disconnect(_connection_name);
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 
@@ -1609,13 +1694,23 @@ BEGIN
     /* be very tight on vacuuming worker and pool tracking tables...they are
      * hit hard and slower scan times can really hurt overall performance.
      */
-    PERFORM dblink_exec(
-      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
-      'VACUUM FULL ANALYZE async.worker');
+    IF (async.query_with_timeout(
+      'VACUUM FULL async.worker',
+      '5 seconds')).failed
+    THEN
+      PERFORM async.log(
+        'WARNING',
+        'Timeout exceeded when vaccuming async.worker');
+    END IF;
 
-    PERFORM dblink_exec(
-      (SELECT connection_string FROM async.target WHERE target = g.self_target), 
-      'VACUUM FULL ANALYZE async.concurrency_pool_tracker');
+    IF (async.query_with_timeout(
+      'VACUUM FULL async.concurrency_pool_tracker',
+      '5 seconds')).failed
+    THEN
+      PERFORM async.log(
+        'WARNING',
+        'Timeout exceeded when vaccuming async.concurrency_pool_tracker');
+    END IF;
 
     DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
@@ -1623,6 +1718,7 @@ BEGIN
         SELECT 1 FROM async.task t
         WHERE 
           t.processed IS NULL
+          AND t.concurrency_pool IS NOT NULL
           AND t.concurrency_pool = cpt.concurrency_pool
       )
       AND
@@ -1732,12 +1828,12 @@ DECLARE
 BEGIN
   _when := clock_timestamp();
 
-  PERFORM async.reap_tasks();
-  _reap_time := clock_timestamp() - _when;
+  _did_internal := async.run_internal();
+  _internal_time := clock_timestamp() - _when;
 
   _when := clock_timestamp();
-  _did_internal := async.run_internal();
-  _internal_time := clock_timestamp() - _when;    
+  PERFORM async.reap_tasks();
+  _reap_time := clock_timestamp() - _when;    
 
   _when := clock_timestamp();
   _did_run := async.run_tasks();
@@ -1904,19 +2000,74 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
-
-CREATE OR REPLACE PROCEDURE async.main(_force BOOL DEFAULT false) AS
+CREATE OR REPLACE PROCEDURE async.cycle(
+  _last_did_stuff INOUT TIMESTAMPTZ DEFAULT NULL,
+  _show_message INOUT BOOL DEFAULT NULL) AS
 $$
-DECLARE 
+DECLARE
   g async.control;
-  _show_message BOOL DEFAULT TRUE;
 
   _did_stuff BOOL DEFAULT FALSE;
 
-  _last_did_stuff TIMESTAMPTZ;
-  _back_off INTERVAL DEFAULT '30 seconds';
+  _back_off INTERVAL DEFAULT '30 seconds';  
+BEGIN
+  SELECT INTO g * FROM async.control;
+
+  IF NOT g.Paused
+  THEN
+    CALL async.do_work(_did_stuff);
+    PERFORM async.clear_latches();
+
+    IF _last_did_stuff IS NULL
+    THEN 
+      RETURN;
+    END IF;
+  END IF;
+
+  /* flush transaction state */
+  COMMIT;
+
+  CALL async.maintenance(_did_stuff);
+
+  IF _did_stuff
+  THEN
+    _show_message := true;
+    _last_did_stuff := clock_timestamp();
+  ELSE
+    IF NOT g.enabled
+    THEN
+      RETURN;
+    END IF;    
+
+    /* wait a little bit before showing message, and be aggressive */      
+    IF _show_message 
+    THEN
+      IF clock_timestamp() - _last_did_stuff > _back_off  
+        OR _last_did_stuff IS NULL
+      THEN
+        _show_message := false;  
+        PERFORM async.log('Nothing to do. sleeping...');
+      END IF;
+
+      PERFORM pg_sleep(g.busy_sleep);
+    ELSE
+      PERFORM pg_sleep(g.idle_sleep);  
+    END IF;
+  END IF;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+CREATE OR REPLACE PROCEDURE async.main(
+  _force BOOL DEFAULT false,
+  _manual_mode BOOL DEFAULT false) AS
+$$
+DECLARE 
+  g async.control;
 
   _acquired BOOL;
+  _last_did_stuff TIMESTAMPTZ DEFAULT now();
+  _show_message BOOL DEFAULT true;
 
   _routine TEXT;
 BEGIN
@@ -1974,7 +2125,8 @@ BEGIN
     processing_error = 'presumed failed due to async startup'
   WHERE 
     consumed IS NOT NULL
-    AND processed IS NULL;
+    AND processed IS NULL
+    AND concurrency_pool IS NOT NULL;
 
   SET LOCAL enable_seqscan TO DEFAULT;
   SET LOCAL enable_bitmapscan TO DEFAULT;
@@ -1994,45 +2146,15 @@ BEGIN
     enabled = true;
 
   PERFORM async.log('Initialization of query processor complete');    
+
+  IF _manual_mode
+  THEN
+    PERFORM async.log('Entering manual mode (CALL async.cycle() to iterate)');    
+    RETURN;
+  END IF;
+
   LOOP
-    SELECT INTO g * FROM async.control;
-
-    IF NOT g.Paused
-    THEN
-      CALL async.do_work(_did_stuff);
-    END IF;
-
-    /* flush transaction state */
-    COMMIT;
-
-    PERFORM async.clear_latches();
-    CALL async.maintenance(_did_stuff);
-
-    IF _did_stuff
-    THEN
-      _show_message := true;
-      _last_did_stuff := clock_timestamp();
-    ELSE
-      IF NOT g.enabled
-      THEN
-        RETURN;
-      END IF;    
- 
-      /* wait a little bit before showing message, and be aggressive */      
-      IF _show_message 
-      THEN
-        IF clock_timestamp() - _last_did_stuff > _back_off  
-          OR _last_did_stuff IS NULL
-        THEN
-          _show_message := false;  
-          PERFORM async.log('Nothing to do. sleeping...');
-        END IF;
-
-        PERFORM pg_sleep(g.busy_sleep);
-      ELSE
-        PERFORM pg_sleep(g.idle_sleep);  
-      END IF;
-    END IF;
+    CALL async.cycle(_last_did_stuff, _show_message);
   END LOOP;  
 END;
 $$ LANGUAGE PLPGSQL;
@@ -2101,13 +2223,14 @@ CREATE OR REPLACE VIEW async.v_concurrency_pool_info AS
   ORDER BY lower(cp.concurrency_pool);  
 
 
-CREATE OR REPLACE FUNCTION async.tail(
+CREATE OR REPLACE FUNCTION async.tail_once(
   _server_log_id BIGINT DEFAULT NULL,
-  _notify BOOL DEFAULT true,
+  _grep TEXT DEFAULT NULL,
   _limit INT DEFAULT 1000) RETURNS SETOF async.server_log AS
 $$
 DECLARE
   l async.server_log;
+  _pre_fetch_rows INT DEFAULT 100;
 BEGIN
   _server_log_id := COALESCE(
     _server_log_id, 
@@ -2118,35 +2241,49 @@ BEGIN
         SELECT server_log 
         FROM async.server_log
         ORDER BY server_log DESC
-        LIMIT _limit
+        LIMIT _pre_fetch_rows
       ) q
     ));
 
-  IF _notify
-  THEN
-    LOOP
-      SELECT INTO l * 
-      FROM async.server_log 
-      WHERE server_log > _server_log_id
-      ORDER BY server_log LIMIT 1;
-
-      IF FOUND
-      THEN
-        RAISE NOTICE '%', l.message;
-        _server_log_id = l.server_log;
-      ELSE
-        PERFORM pg_sleep(.1);
-      END IF;
-    END LOOP;
-  ELSE
-    RETURN QUERY SELECT * 
-      FROM async.server_log 
-      WHERE server_log > _server_log_id
-      ORDER BY server_log LIMIT _limit;  
-  END IF;
+  RETURN QUERY SELECT * 
+    FROM async.server_log 
+    WHERE 
+      server_log > _server_log_id
+      AND (_grep IS NULL OR message LIKE '%' || _grep || '%')
+    ORDER BY server_log LIMIT _limit;  
 END;
 $$ LANGUAGE PLPGSQL;
 
 
+CREATE OR REPLACE PROCEDURE async.tail(
+  _grep TEXT DEFAULT NULL,
+  _limit INT DEFAULT 1000) AS
+$$
+DECLARE
+  l RECORD;
+  _server_log_id BIGINT;
+  _found BOOL;
+BEGIN
+  LOOP
+    FOR l IN 
+      SELECT * 
+      FROM async.tail_once(_server_log_id, _grep, _limit)
+    LOOP
+      _found := true;
+      RAISE NOTICE '[%]: %', l.server_log, l.message;
 
+      _server_log_id := l.server_log;
+    END LOOP;
+
+    IF NOT _found 
+    THEN
+      PERFORM pg_sleep(.1);
+    END IF;
+
+    COMMIT;
+
+    _found := false;
+  END LOOP;
+END;
+$$ LANGUAGE PLPGSQL;
 
