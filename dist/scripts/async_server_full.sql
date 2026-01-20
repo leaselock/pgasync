@@ -542,7 +542,7 @@ END;
 CREATE TABLE async.control
 (
   enabled BOOL DEFAULT true,
-  workers INT DEFAULT 20,
+  workers INT DEFAULT 100,
   idle_sleep FLOAT8 DEFAULT 0.1,
   heavy_maintenance_sleep INTERVAL DEFAULT '24 hours'::INTERVAL,
   task_keep_duration INTERVAL DEFAULT '30 days'::INTERVAL,
@@ -1702,7 +1702,7 @@ BEGIN
 
     PERFORM async.log('Performing heavy maintenance');
     COMMIT;
-
+perform pg_sleep(60);
     UPDATE async.control SET last_heavy_maintenance = now();
 
     DELETE FROM async.task WHERE processed <= now() - g.task_keep_duration;
@@ -1732,23 +1732,16 @@ BEGIN
       format('Got %s when vaccuming async.worker', response))
     FROM async.query_with_timeout(
       'VACUUM FULL async.worker',
-      '5 seconds');
+      '5 seconds')
+    WHERE failed;
 
     PERFORM async.log(
       'WARNING',
-      format('Got %s when vaccuming async.worker', response))
+      format('Got %s when vaccuming async.concurrency_pool_tracker', response))
     FROM async.query_with_timeout(
-      'VACUUM FULL async.worker',
-      '5 seconds');    
-
-    IF (async.query_with_timeout(
       'VACUUM FULL async.concurrency_pool_tracker',
-      '5 seconds')).failed
-    THEN
-      PERFORM async.log(
-        'WARNING',
-        'Got error when vaccuming async.concurrency_pool_tracker');
-    END IF;
+      '5 seconds')
+    WHERE failed;
 
     DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
@@ -2143,6 +2136,7 @@ BEGIN
 
   /* attempt to acquire process lock */
   PERFORM async.log('Initializing asynchronous query processor');
+  COMMIT;
 
   /* if being run from pg_cron, lower client messages to try and minimize log
    * pollution.
@@ -2156,6 +2150,9 @@ BEGIN
 
   /* dragons live forever, but not so little boys */
   SET statement_timeout = 0;
+
+  /* jit can lead to performance problems in main orchestrator loop */
+  SET jit = off;
   
   /* run maintenance now as a precaution */
   CALL async.maintenance(true);
@@ -2302,6 +2299,10 @@ CREATE OR REPLACE VIEW async.v_server_info AS
     last_message,
     CASE 
       WHEN NOT enabled AND observed_pid IS NULL THEN 'paused'
+      WHEN last_message LIKE 'Initializing asynchronous query processor%'
+        THEN format(
+          'starting up for %s',
+          async.interval_pretty(now() - running_since))
       WHEN server_pid IS NULL THEN 'never started'
       WHEN server_pid IS DISTINCT FROM observed_pid 
         AND lock_pid IS NOT NULL THEN 'Not running (locked in console?)'
