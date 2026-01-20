@@ -24,7 +24,7 @@ END;
 CREATE TABLE async.control
 (
   enabled BOOL DEFAULT true,
-  workers INT DEFAULT 20,
+  workers INT DEFAULT 100,
   idle_sleep FLOAT8 DEFAULT 0.1,
   heavy_maintenance_sleep INTERVAL DEFAULT '24 hours'::INTERVAL,
   task_keep_duration INTERVAL DEFAULT '30 days'::INTERVAL,
@@ -1042,13 +1042,14 @@ $$ LANGUAGE PLPGSQL;
 
 
 /* Update task to completion state based on query resolving in background. */
-CREATE OR REPLACE FUNCTION async.reap_tasks() RETURNS VOID AS 
+CREATE OR REPLACE FUNCTION async.reap_tasks() RETURNS BOOL AS 
 $$
 DECLARE
   r RECORD;
   _error_message TEXT;
   _failed BOOL;
   _reap_task_ids BIGINT[];
+  _did_stuff BOOL DEFAULT false;
 BEGIN
   PERFORM async.finish_internal(
     tasks,
@@ -1068,6 +1069,8 @@ BEGIN
   )
   WHERE array_upper(tasks, 1) >= 1;
 
+  _did_stuff := FOUND;
+
   PERFORM async.finish_internal(
     task_ids,
     NULL::async.finish_status_t,
@@ -1085,6 +1088,8 @@ BEGIN
       AND dblink_is_busy(w.name) != 1
   ) q
   WHERE array_upper(task_ids, 1) >= 1;
+
+  RETURN _did_stuff OR FOUND;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -1101,6 +1106,8 @@ DECLARE
   _return TEXT;
   _query_start TIMESTAMPTZ DEFAULT clock_timestamp();
   g async.control;
+
+  _connected BOOL;
 BEGIN
   SELECT INTO g * FROM async.control;
 
@@ -1110,6 +1117,8 @@ BEGIN
   PERFORM dblink_connect(
     _connection_name,
     _connection_string);
+
+  _connected := true;
 
   PERFORM dblink_send_query(_connection_name, _query);
 
@@ -1122,8 +1131,14 @@ BEGIN
   IF dblink_is_busy(_connection_name) = 0
   THEN
     failed := false;
-    PERFORM * FROM dblink_get_result(_connection_name, false) AS R(v TEXT);
-    response := dblink_error_message(_connection_name);
+    BEGIN
+      PERFORM * FROM dblink_get_result(_connection_name, false) AS R(v TEXT);
+      response := dblink_error_message(_connection_name);
+    EXCEPTION WHEN OTHERS THEN
+      failed := false;
+      response := SQLERRM;
+    END;
+    
     PERFORM * FROM dblink_get_result(_connection_name) AS R(v TEXT);  
   ELSE
     failed := true;
@@ -1133,6 +1148,20 @@ BEGIN
   END IF;
 
   PERFORM dblink_disconnect(_connection_name);
+EXCEPTION 
+  WHEN OTHERS THEN
+    failed := true;
+    response := SQLERRM;
+
+    IF _connected
+    THEN
+      BEGIN
+        PERFORM dblink_disconnect(_connection_name);
+      EXCEPTION
+      WHEN OTHERS THEN NULL;
+      END;
+    END IF;
+
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -1154,6 +1183,8 @@ BEGIN
     _start := clock_timestamp();
 
     PERFORM async.log('Performing heavy maintenance');
+    COMMIT;
+perform pg_sleep(60);
     UPDATE async.control SET last_heavy_maintenance = now();
 
     DELETE FROM async.task WHERE processed <= now() - g.task_keep_duration;
@@ -1171,28 +1202,28 @@ BEGIN
   THEN
     _start := clock_timestamp();
 
+    PERFORM async.log('Performing heavy maintenance');
+
     COMMIT;
 
     /* be very tight on vacuuming worker and pool tracking tables...they are
      * hit hard and slower scan times can really hurt overall performance.
      */
-    IF (async.query_with_timeout(
+    PERFORM async.log(
+      'WARNING',
+      format('Got %s when vaccuming async.worker', response))
+    FROM async.query_with_timeout(
       'VACUUM FULL async.worker',
-      '5 seconds')).failed
-    THEN
-      PERFORM async.log(
-        'WARNING',
-        'Timeout exceeded when vaccuming async.worker');
-    END IF;
+      '5 seconds')
+    WHERE failed;
 
-    IF (async.query_with_timeout(
+    PERFORM async.log(
+      'WARNING',
+      format('Got %s when vaccuming async.concurrency_pool_tracker', response))
+    FROM async.query_with_timeout(
       'VACUUM FULL async.concurrency_pool_tracker',
-      '5 seconds')).failed
-    THEN
-      PERFORM async.log(
-        'WARNING',
-        'Timeout exceeded when vaccuming async.concurrency_pool_tracker');
-    END IF;
+      '5 seconds')
+    WHERE failed;
 
     DELETE FROM async.concurrency_pool_tracker cpt
     WHERE 
@@ -1298,43 +1329,51 @@ CREATE OR REPLACE PROCEDURE async.do_work(did_work INOUT BOOL DEFAULT NULL) AS
 $$
 DECLARE
   _when TIMESTAMPTZ;
-  _total_time TIMESTAMPTZ DEFAULT clock_timestamp();
+  _work_start TIMESTAMPTZ;
   _reap_time INTERVAL;
   _internal_time INTERVAL;
   _routine_time INTERVAL;
+  _since_commit INTERVAL;
+  _total_time INTERVAL;
   _finish_time TIMESTAMPTZ;
+  _commit_start TIMESTAMPTZ;
 
   _run_time INTERVAL;
   _did_internal BOOL;
   _did_run BOOL;
+  _did_reap BOOL;
 BEGIN
+  _commit_start := now();
+
   _when := clock_timestamp();
 
+  _work_start := _when;
   _did_internal := async.run_internal();
   _internal_time := clock_timestamp() - _when;
 
   _when := clock_timestamp();
-  PERFORM async.reap_tasks();
+  _did_reap := async.reap_tasks();
   _reap_time := clock_timestamp() - _when;    
 
   _when := clock_timestamp();
   _did_run := async.run_tasks();
+  did_work := _did_internal OR _did_run OR _did_reap;
   _run_time := clock_timestamp() - _when;
-
-  did_work := _did_internal OR _did_run;
 
   _when := clock_timestamp();
   CALL async.run_routines('LOOP');
-
   _finish_time := clock_timestamp();
   _routine_time := _finish_time - _when;
+
+  _total_time := _finish_time - _work_start;
+  _since_commit := _finish_time - _commit_start;
 
   IF did_work
   THEN
     PERFORM async.log(
       format(
         'timing: total: %s since commit: %s reap: %s internal: %s run: %s routine: %s', 
-        _finish_time - _total_time,
+        _total_time,
         _finish_time - now(),
         _reap_time, 
         _internal_time, 
@@ -1574,8 +1613,12 @@ BEGIN
     RETURN;
   END IF;
 
+  UPDATE async.control SET 
+    running_since = clock_timestamp();
+
   /* attempt to acquire process lock */
   PERFORM async.log('Initializing asynchronous query processor');
+  COMMIT;
 
   /* if being run from pg_cron, lower client messages to try and minimize log
    * pollution.
@@ -1589,6 +1632,9 @@ BEGIN
 
   /* dragons live forever, but not so little boys */
   SET statement_timeout = 0;
+
+  /* jit can lead to performance problems in main orchestrator loop */
+  SET jit = off;
   
   /* run maintenance now as a precaution */
   CALL async.maintenance(true);
@@ -1624,7 +1670,6 @@ BEGIN
 
   UPDATE async.control SET 
     pid = pg_backend_pid(),
-    running_since = clock_timestamp(),
     enabled = true;
 
   PERFORM async.log('Initialization of query processor complete');    
