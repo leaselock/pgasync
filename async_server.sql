@@ -1184,10 +1184,11 @@ BEGIN
 
     PERFORM async.log('Performing heavy maintenance');
     COMMIT;
-perform pg_sleep(60);
-    UPDATE async.control SET last_heavy_maintenance = now();
 
-    DELETE FROM async.task WHERE processed <= now() - g.task_keep_duration;
+    UPDATE async.control SET last_heavy_maintenance = clock_timestamp();
+
+    DELETE FROM async.task WHERE processed <= clock_timestamp() 
+      - g.task_keep_duration;
 
     PERFORM async.log(format(
       'Performed heavy maintenance in %s seconds',
