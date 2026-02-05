@@ -280,7 +280,7 @@ BEGIN
       FROM async.tail_once(_server_log_id, _grep, _limit)
     LOOP
       _found := true;
-      RAISE NOTICE '[%]: %', l.server_log, l.message;
+      RAISE NOTICE '[% - %]: %', l.happened::TIMESTAMPTZ(2), l.server_log, l.message;
 
       _server_log_id := l.server_log;
     END LOOP;
