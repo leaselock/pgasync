@@ -85,7 +85,7 @@ CREATE OR REPLACE VIEW async.v_server_info AS
       AS uptime,
     last_message,
     CASE 
-      WHEN NOT enabled AND observed_pid IS NULL THEN 'paused'
+      WHEN NOT enabled AND observed_pid IS NULL THEN 'disabled'
       WHEN last_message LIKE 'Initializing asynchronous query processor%'
         THEN format(
           'starting up for %s',
@@ -94,6 +94,7 @@ CREATE OR REPLACE VIEW async.v_server_info AS
       WHEN server_pid IS DISTINCT FROM observed_pid 
         AND lock_pid IS NOT NULL THEN 'Not running (locked in console?)'
       WHEN server_pid IS DISTINCT FROM observed_pid THEN 'Not running'
+      WHEN paused THEN 'paused'
       WHEN last_message = 'Performing heavy maintenance'
         THEN format(
           'In heavy maintenance for %s', 
@@ -142,16 +143,20 @@ CREATE OR REPLACE VIEW async.v_server_info AS
       c.pid AS server_pid,      
       s.pid AS observed_pid,
       enabled,
+      paused,
       lk.pid AS lock_pid
     FROM async.control c
     LEFT JOIN pg_stat_activity s ON 
       s.query ILIKE '%call async.main(%'
       AND s.pid != pg_backend_pid()
       AND state != 'idle'
+      AND datname = current_database()
     LEFT JOIN pg_locks lk ON 
       locktype = 'advisory'
       AND objid = c.advisory_mutex_id
       AND granted
+      AND database = 
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     LEFT JOIN
     (
       SELECT * FROM async.server_log ORDER BY 1 DESC LIMIT 1

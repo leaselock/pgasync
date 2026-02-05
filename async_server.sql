@@ -341,6 +341,89 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+/* reconfigure worker count on the fly. Will only adjust down if the 
+ * until hitting a busy slot.
+ */
+CREATE OR REPLACE FUNCTION async.reinitialize_workers() RETURNS VOID AS
+$$
+DECLARE
+  _live_worker_count INT;
+  _configured_worker_count INT;
+  _active_connections TEXT[];
+  w RECORD;
+  _min_free_slot INT;
+BEGIN
+  SELECT INTO _live_worker_count count(*) FROM async.worker;
+  SELECT INTO _configured_worker_count workers FROM async.control;
+
+  IF _configured_worker_count = _live_worker_count
+  THEN
+    RETURN;
+  END IF;
+
+  IF _configured_worker_count > _live_worker_count
+  THEN
+    PERFORM async.log(
+      format('Expanding worker count from %s to %s workers',
+      _live_worker_count, 
+      _configured_worker_count));
+
+    INSERT INTO async.worker SELECT 
+      s,
+      'async.worker_' || s
+    FROM generate_series(_live_worker_count + 1, _configured_worker_count) s;
+  ELSE
+    SELECT INTO _min_free_slot min(slot)
+    FROM async.worker w1
+    WHERE 
+      slot > _configured_worker_count
+      AND NOT EXISTS (
+        SELECT 1 FROM async.worker w2
+        WHERE 
+          w2.slot >= w1.slot
+          AND w2.slot > _configured_worker_count
+          AND w2.task_id IS NOT NULL
+      );
+
+    IF _min_free_slot IS NULL
+    THEN
+      PERFORM async.log('Unable to free any workers due to being active');
+      RETURN;
+    END IF;
+
+    IF _min_free_slot > _configured_worker_count + 1
+    THEN
+      PERFORM async.log(
+        format(
+          'Reducing to %s workers, accounting for tasks in progress',
+          _min_free_slot));
+    ELSE
+      PERFORM async.log(
+        format(
+          'Reducing worker count from %s to %s workers',
+          _live_worker_count, 
+          _configured_worker_count));    
+    END IF;
+
+    _active_connections := dblink_get_connections();
+
+    FOR w IN 
+      SELECT *, name = ANY(_active_connections) AS active 
+      FROM async.worker w
+      WHERE slot >= _min_free_slot
+    LOOP
+      IF w.active 
+      THEN
+        PERFORM async.disconnect(name, 'worker shutdown');
+      END IF;
+
+      DELETE FROM async.worker WHERE slot = w.slot;
+    END LOOP;
+  END IF;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 
 CREATE OR REPLACE FUNCTION async.active_workers() RETURNS BIGINT AS
 $$
@@ -1808,14 +1891,21 @@ BEGIN
       RETURN;
     END IF;    
 
-    /* wait a little bit before showing message, and be aggressive */      
-    IF _show_message 
+    /* wait a little bit before showing message */      
+    IF _show_message OR g.paused
     THEN
       IF clock_timestamp() - _last_did_stuff > _back_off  
         OR _last_did_stuff IS NULL
       THEN
-        _show_message := false;  
-        PERFORM async.log('Nothing to do. sleeping...');
+        IF g.paused 
+        THEN
+          _last_did_stuff := now(); 
+          _show_message := true;
+          PERFORM async.log('Server paused.');
+        ELSE 
+          _show_message := false;  
+          PERFORM async.log('Nothing to do. sleeping...');
+        END IF;
       END IF;
 
       PERFORM pg_sleep(g.busy_sleep);
