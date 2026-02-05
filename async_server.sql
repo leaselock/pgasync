@@ -833,10 +833,16 @@ BEGIN
 
       UPDATE async.task SET
         consumed = clock_timestamp(),
-        times_up = now() + COALESCE(
-          manual_timeout,
-          r.default_timeout,
-          c.default_timeout),
+        times_up = 
+          CASE 
+            WHEN finish_status = 'DEFERRED' AND times_up IS NOT NULL
+              THEN times_up
+            ELSE
+              now() + COALESCE(
+                manual_timeout,
+                r.default_timeout,
+                c.default_timeout)
+            END,
         tracked = true
       WHERE task_id = r.task_id;
 
