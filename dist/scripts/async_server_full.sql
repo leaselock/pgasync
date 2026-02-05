@@ -647,7 +647,13 @@ CREATE INDEX ON async.task(times_up)
     /* postgres strangely picks this index when it should not, so force an
      * unusual qual so that it is ineligible for standard queries
      */
-    AND concurrency_pool IS NOT NULL; 
+    AND times_up IS NOT NULL;
+
+/* supports cleaning up dead tasks on startup */
+CREATE INDEX ON async.task(task_id)
+  WHERE 
+    consumed IS NOT NULL
+    AND processed IS NULL;    
 
 
 CREATE UNLOGGED TABLE async.worker
@@ -853,6 +859,89 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+/* reconfigure worker count on the fly. Will only adjust down if the 
+ * until hitting a busy slot.
+ */
+CREATE OR REPLACE FUNCTION async.reinitialize_workers() RETURNS VOID AS
+$$
+DECLARE
+  _live_worker_count INT;
+  _configured_worker_count INT;
+  _active_connections TEXT[];
+  w RECORD;
+  _min_free_slot INT;
+BEGIN
+  SELECT INTO _live_worker_count count(*) FROM async.worker;
+  SELECT INTO _configured_worker_count workers FROM async.control;
+
+  IF _configured_worker_count = _live_worker_count
+  THEN
+    RETURN;
+  END IF;
+
+  IF _configured_worker_count > _live_worker_count
+  THEN
+    PERFORM async.log(
+      format('Expanding worker count from %s to %s workers',
+      _live_worker_count, 
+      _configured_worker_count));
+
+    INSERT INTO async.worker SELECT 
+      s,
+      'async.worker_' || s
+    FROM generate_series(_live_worker_count + 1, _configured_worker_count) s;
+  ELSE
+    SELECT INTO _min_free_slot min(slot)
+    FROM async.worker w1
+    WHERE 
+      slot > _configured_worker_count
+      AND NOT EXISTS (
+        SELECT 1 FROM async.worker w2
+        WHERE 
+          w2.slot >= w1.slot
+          AND w2.slot > _configured_worker_count
+          AND w2.task_id IS NOT NULL
+      );
+
+    IF _min_free_slot IS NULL
+    THEN
+      PERFORM async.log('Unable to free any workers due to being active');
+      RETURN;
+    END IF;
+
+    IF _min_free_slot > _configured_worker_count + 1
+    THEN
+      PERFORM async.log(
+        format(
+          'Reducing to %s workers, accounting for tasks in progress',
+          _min_free_slot));
+    ELSE
+      PERFORM async.log(
+        format(
+          'Reducing worker count from %s to %s workers',
+          _live_worker_count, 
+          _configured_worker_count));    
+    END IF;
+
+    _active_connections := dblink_get_connections();
+
+    FOR w IN 
+      SELECT *, name = ANY(_active_connections) AS active 
+      FROM async.worker w
+      WHERE slot >= _min_free_slot
+    LOOP
+      IF w.active 
+      THEN
+        PERFORM async.disconnect(name, 'worker shutdown');
+      END IF;
+
+      DELETE FROM async.worker WHERE slot = w.slot;
+    END LOOP;
+  END IF;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 
 CREATE OR REPLACE FUNCTION async.active_workers() RETURNS BIGINT AS
 $$
@@ -894,6 +983,70 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
   ) 
   ORDER BY priority, entered
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
+
+CREATE OR REPLACE VIEW async.v_task_assigned_worker AS 
+  WITH tasks_to_run AS MATERIALIZED
+  (
+    SELECT 
+      t.*,
+      row_number() OVER (PARTITION BY target) idx 
+    FROM async.v_candidate_task t
+    WHERE query IS NOT NULL
+  ),
+  avail_workers AS
+  (
+    SELECT 
+      w2.*,
+      row_number() OVER (PARTITION BY target) idx
+    FROM async.worker w2
+    WHERE w2.task_id IS NULL
+  ),
+  matched_target AS
+  (
+    SELECT 
+      t.*,
+      NULL::INT AS idx2,
+      aw.slot,
+      aw.name,
+      'keep'::TEXT AS connect_action
+    FROM tasks_to_run t
+    JOIN avail_workers aw USING(target, idx)
+  ),
+  remain_workers AS
+  (
+    SELECT 
+      w2.*,
+      row_number() OVER (
+        PARTITION BY w2.target
+        ORDER BY CASE WHEN w2.target IS NULL THEN 0 ELSE 1 END) idx2
+    FROM async.worker w2
+    LEFT JOIN matched_target mt USING(slot)
+    WHERE 
+      mt.target IS NULL
+      AND w2.task_id IS NULL
+  ),
+  remain_tasks AS
+  (
+    SELECT 
+      t.*,
+      row_number() OVER (
+        PARTITION BY t.target) idx2
+    FROM tasks_to_run t
+    LEFT JOIN matched_target mt USING (task_id)
+    WHERE mt.task_id IS NULL
+  )
+  SELECT mt.* 
+  FROM matched_target mt
+  UNION ALL SELECT 
+    rt.*,
+    rw.slot,
+    rw.name,
+    CASE WHEN 
+      rw.target IS NULL THEN 'connect'::TEXT 
+      ELSE 'reconnect' 
+    END AS connect_action      
+  FROM remain_tasks rt
+  JOIN remain_workers rw USING(idx2);
 
 
 
@@ -987,41 +1140,23 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
-/* returns true if at least one task was run */
-CREATE OR REPLACE FUNCTION async.run_tasks(did_stuff OUT BOOL) RETURNS BOOL AS
+/* experimental version to consolidate queries reading and writing */
+CREATE OR REPLACE FUNCTION async.run_tasks_experimental(did_stuff OUT BOOL) RETURNS BOOL AS
 $$
 DECLARE
-  r async.v_candidate_task;
-  w RECORD;
+  r RECORD;
   c async.control;
   _max_retry_count INT DEFAULT 5;
   _retry_counter INT DEFAULT 1;
+
+  _tasks_ran JSONB DEFAULT '[]'::JSONB;
 BEGIN 
   did_stuff := false;
 
   SELECT INTO c * FROM async.control;
 
-  FOR r IN SELECT * FROM async.v_candidate_task
-    WHERE query IS NOT NULL
+  FOR r IN SELECT * FROM async.v_task_assigned_worker
   LOOP
-    SELECT INTO w 
-      *,
-      CASE 
-        WHEN w2.target IS NULL THEN 'connect'
-        WHEN r.target IS NOT DISTINCT FROM w2.target THEN 'keep'
-        ELSE 'reconnect' 
-      END AS connect_action
-    FROM async.worker w2
-    WHERE task_id IS NULL
-    ORDER BY 
-      CASE WHEN r.target IS NOT DISTINCT FROM w2.target 
-        THEN 0
-        ELSE 1
-      END, 
-      CASE WHEN w2.target IS NULL THEN 0 ELSE 1 END,
-      slot 
-    LIMIT 1;
-
     BEGIN
       PERFORM async.log(
         'DEBUG',
@@ -1029,18 +1164,18 @@ BEGIN
           'Running task id %s pool %s slot: %s %s %s[action %s]', 
           r.task_id, 
           r.concurrency_pool,
-          w.slot,
+          r.slot,
           COALESCE('data: "' || r.task_data::TEXT || '" ', ''),
           CASE WHEN r.source IS NOT NULL
             THEN format('via %s ',  r.source)
             ELSE ''
           END,
-          w.connect_action));
+          r.connect_action));
     
-      IF w.connect_action = 'keep'
+      IF r.connect_action = 'keep'
       THEN
         BEGIN
-          PERFORM * FROM dblink(w.name, 'SELECT 0') AS R(v INT);
+          PERFORM * FROM dblink(r.name, 'SELECT 0') AS R(v INT);
         EXCEPTION WHEN OTHERS THEN
           PERFORM async.log(
             'WARNING',
@@ -1048,21 +1183,21 @@ BEGIN
               'When attempting to run task: %s in slot: %s '
               'for connection: %s, got %s', 
               r.task_id,
-              w.slot,
-              to_json(w),
+              r.slot,
+              r.name,
               SQLERRM));
 
-            w.connect_action := 'reconnect';
+            r.connect_action := 'reconnect';
         END;
       END IF;
 
-      IF w.connect_action = 'reconnect'
+      IF r.connect_action = 'reconnect'
       THEN
-        PERFORM async.disconnect(w.name, 'reconnect');
-        w.connect_action = 'connect';
+        PERFORM async.disconnect(r.name, 'reconnect');
+        r.connect_action = 'connect';
       END IF;
 
-      IF w.connect_action = 'connect'
+      IF r.connect_action = 'connect'
       THEN
         LOOP
           /* give it the old college try...if connection fields repeat a few 
@@ -1071,7 +1206,7 @@ BEGIN
            * back with some future execution time.
            */
           BEGIN 
-            PERFORM dblink_connect(w.name, r.connection_string);
+            PERFORM dblink_connect(r.name, r.connection_string);
 
             EXIT;
           EXCEPTION WHEN OTHERS THEN
@@ -1098,27 +1233,15 @@ BEGIN
       /* because the task id is not available to the task creators, inject it
        * via special macro.
        */
-      PERFORM dblink_send_query(w.name, async.wrap_query(
+      PERFORM dblink_send_query(r.name, async.wrap_query(
         replace(r.query, '##flow.TASK_ID##', r.task_id::TEXT), r.task_id));
 
-      UPDATE async.worker SET
-        task_id = r.task_id,
-        target = r.target,
-        running_since = clock_timestamp()
-      WHERE slot = w.slot;
-
-      UPDATE async.task SET 
-        consumed = clock_timestamp(),
-        times_up = now() + COALESCE(
-          manual_timeout, 
-          r.default_timeout, 
-          c.default_timeout),
-        tracked = true
-      WHERE task_id = r.task_id;
-
-      UPDATE async.concurrency_pool_tracker
-      SET workers = workers + 1
-      WHERE concurrency_pool = r.concurrency_pool;
+      _tasks_ran := _tasks_ran || jsonb_build_object(
+        'task_id', r.task_id,
+        'target', r.target,
+        'slot', r.slot,
+        'pool', r.concurrency_pool,
+        'timeout', r.default_timeout);
 
     EXCEPTION WHEN OTHERS THEN
       PERFORM async.log(
@@ -1133,12 +1256,220 @@ BEGIN
         processing_error = SQLERRM
       WHERE task_id = r.task_id;
 
+      PERFORM async.disconnect(r.name, 'run task failure');
+    END;
+
+    did_stuff := true;
+  END LOOP;
+
+  IF did_stuff
+  THEN
+    WITH tasks_ran AS
+    (
+      SELECT
+        (j->>'task_id')::BIGINT AS task_id,
+        j->>'target' AS target,
+        (j->>'slot')::INT AS slot,
+        j->>'pool' AS concurrency_pool,
+        (j->>'timeout')::INTERVAL AS default_timeout,
+        timing
+      FROM jsonb_array_elements(_tasks_ran) j
+      CROSS JOIN (SELECT clock_timestamp() AS timing) 
+    ),
+    upd_worker AS
+    (
+      UPDATE async.worker aw SET
+        task_id = tr.task_id,
+        target = tr.target,
+        running_since = timing
+      FROM tasks_ran tr
+      WHERE tr.slot = aw.slot
+    ),
+    upd_task AS
+    (
+      UPDATE async.task t SET 
+        consumed = timing,
+        times_up = timing + COALESCE(
+          manual_timeout, 
+          default_timeout, 
+          c.default_timeout),
+        tracked = true
+      FROM tasks_ran tr
+      WHERE tr.task_id = t.task_id
+    )
+    UPDATE async.concurrency_pool_tracker cpt
+    SET workers = workers + count
+    FROM
+    (
+      SELECT
+        concurrency_pool,
+        COUNT(*)
+      FROM tasks_ran 
+      GROUP BY 1
+    ) q
+    WHERE cpt.concurrency_pool = q.concurrency_pool;         
+  END IF;
+END; 
+$$ LANGUAGE PLPGSQL;
+
+/* looks up eligible tasks and assigns to a worker */
+CREATE OR REPLACE FUNCTION async.run_tasks(did_stuff OUT BOOL) RETURNS BOOL AS
+$$
+DECLARE
+  r async.v_candidate_task;
+  w RECORD;
+  c async.control;
+  _max_retry_count INT DEFAULT 5;
+  _retry_counter INT DEFAULT 1;
+BEGIN
+  did_stuff := false;
+
+  SELECT INTO c * FROM async.control;
+
+  FOR r IN SELECT * FROM async.v_candidate_task
+    WHERE query IS NOT NULL
+  LOOP
+    SELECT INTO w
+      *,
+      CASE
+        WHEN w2.target IS NULL THEN 'connect'
+        WHEN r.target IS NOT DISTINCT FROM w2.target THEN 'keep'
+        ELSE 'reconnect'
+      END AS connect_action
+    FROM async.worker w2
+    WHERE task_id IS NULL
+    ORDER BY
+      CASE WHEN r.target IS NOT DISTINCT FROM w2.target
+        THEN 0
+        ELSE 1
+      END,
+      CASE WHEN w2.target IS NULL THEN 0 ELSE 1 END,
+      slot
+    LIMIT 1;
+
+    BEGIN
+      PERFORM async.log(
+        'DEBUG',
+        format(
+          'Running task id %s pool %s slot: %s %s %s[action %s]',
+          r.task_id,
+          r.concurrency_pool,
+          w.slot,
+          COALESCE('data: "' || r.task_data::TEXT || '" ', ''),
+          CASE WHEN r.source IS NOT NULL
+            THEN format('via %s ',  r.source)
+            ELSE ''
+          END,
+          w.connect_action));
+
+      IF w.connect_action = 'keep'
+      THEN
+        BEGIN
+          PERFORM * FROM dblink(w.name, 'SELECT 0') AS R(v INT);
+        EXCEPTION WHEN OTHERS THEN
+          PERFORM async.log(
+            'WARNING',
+            format(
+              'When attempting to run task: %s in slot: %s '
+              'for connection: %s, got %s',
+              r.task_id,
+              w.slot,
+              to_json(w),
+              SQLERRM));
+
+            w.connect_action := 'reconnect';
+        END;
+      END IF;
+
+      IF w.connect_action = 'reconnect'
+      THEN
+        PERFORM async.disconnect(w.name, 'reconnect');
+        w.connect_action = 'connect';
+      END IF;
+
+      IF w.connect_action = 'connect'
+      THEN
+        LOOP
+          /* give it the old college try...if connection fields repeat a few
+           * times before giving up.
+           * XXX: Maybe better to yield the task
+           * back with some future execution time.
+           */
+          BEGIN
+            PERFORM dblink_connect(w.name, r.connection_string);
+
+            EXIT;
+          EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM = 'could not establish connetction'
+              AND _retry_counter < _max_retry_count
+            THEN
+              PERFORM async.log(
+                'WARNING',
+                format(
+                  'Retrying failed connection when runnning task %s '
+                  '(attempt %s of %s)',
+                  r.task_id,
+                  _retry_counter,
+                  _max_retry_count));
+
+              _retry_counter := _retry_counter + 1;
+            ELSE
+              RAISE;
+            END IF;
+          END;
+        END LOOP;
+      END IF;
+
+      /* because the task id is not available to the task creators, inject it
+       * via special macro.
+       */
+      PERFORM dblink_send_query(w.name, async.wrap_query(
+        replace(r.query, '##flow.TASK_ID##', r.task_id::TEXT), r.task_id));
+
+      UPDATE async.worker SET
+        task_id = r.task_id,
+        target = r.target,
+        running_since = clock_timestamp()
+      WHERE slot = w.slot;
+
+      UPDATE async.task SET
+        consumed = clock_timestamp(),
+        times_up = 
+          CASE 
+            WHEN finish_status = 'DEFERRED' AND times_up IS NOT NULL
+              THEN times_up
+            ELSE
+              now() + COALESCE(
+                manual_timeout,
+                r.default_timeout,
+                c.default_timeout)
+            END,
+        tracked = true
+      WHERE task_id = r.task_id;
+
+      UPDATE async.concurrency_pool_tracker
+      SET workers = workers + 1
+      WHERE concurrency_pool = r.concurrency_pool;
+
+    EXCEPTION WHEN OTHERS THEN
+      PERFORM async.log(
+        'WARNING',
+        format('Got %s when attempting to run task %s', SQLERRM, r.task_id));
+
+      UPDATE async.task SET
+        consumed = clock_timestamp(),
+        processed = clock_timestamp(),
+        failed = true,
+        finish_status = 'FAILED',
+        processing_error = SQLERRM
+      WHERE task_id = r.task_id;
+
       PERFORM async.disconnect(w.name, 'run task failure');
     END;
 
     did_stuff := true;
   END LOOP;
-END;  
+END;
 $$ LANGUAGE PLPGSQL;
 
 
@@ -1581,8 +1912,6 @@ BEGIN
     FROM async.task t
     WHERE 
       processed IS NULL
-      /* making extra extra sure partial index is utilized */
-      AND concurrency_pool IS NOT NULL
       AND times_up < now()
   )
   WHERE array_upper(tasks, 1) >= 1;
@@ -1692,6 +2021,8 @@ DECLARE
   g async.control;
   _bad_pools TEXT[];
   _start TIMESTAMPTZ;
+
+  cpt RECORD;
 BEGIN 
   SELECT INTO g * FROM async.control;
   
@@ -1702,10 +2033,11 @@ BEGIN
 
     PERFORM async.log('Performing heavy maintenance');
     COMMIT;
-perform pg_sleep(60);
-    UPDATE async.control SET last_heavy_maintenance = now();
 
-    DELETE FROM async.task WHERE processed <= now() - g.task_keep_duration;
+    UPDATE async.control SET last_heavy_maintenance = clock_timestamp();
+
+    DELETE FROM async.task WHERE processed <= clock_timestamp() 
+      - g.task_keep_duration;
 
     PERFORM async.log(format(
       'Performed heavy maintenance in %s seconds',
@@ -1720,7 +2052,7 @@ perform pg_sleep(60);
   THEN
     _start := clock_timestamp();
 
-    PERFORM async.log('Performing heavy maintenance');
+    PERFORM async.log('Performing light maintenance');
 
     COMMIT;
 
@@ -1743,24 +2075,29 @@ perform pg_sleep(60);
       '5 seconds')
     WHERE failed;
 
-    DELETE FROM async.concurrency_pool_tracker cpt
-    WHERE 
-      NOT EXISTS (
-        SELECT 1 FROM async.task t
-        WHERE 
-          t.processed IS NULL
-          AND t.concurrency_pool IS NOT NULL
-          AND t.concurrency_pool = cpt.concurrency_pool
-      )
-      AND
-      (
+    FOR cpt IN SELECT * FROM async.concurrency_pool_tracker 
+      WHERE 
         workers < 0
         OR 
         (
           workers = 0
           AND concurrency_pool NOT IN (SELECT target FROM async.target)
         )
-      );
+    LOOP
+      PERFORM * FROM async.task t WHERE 
+        t.processed IS NULL
+        AND t.concurrency_pool IS NOT NULL
+        AND t.concurrency_pool = cpt.concurrency_pool
+      LIMIT 1;
+
+      IF FOUND 
+      THEN
+        CONTINUE;
+      END IF;
+
+      DELETE FROM async.concurrency_pool_tracker 
+      WHERE concurrency_pool = cpt.concurrency_pool;
+    END LOOP;
 
     UPDATE async.control SET last_light_maintenance = now();
 
@@ -1933,14 +2270,8 @@ $$
 DECLARE
   r RECORD;
 BEGIN
-  FOR r IN 
-    UPDATE async.request_latch SET ready = now()
-    WHERE ready IS NULL
-    RETURNING request_latch_id
-  LOOP
-    PERFORM async.log(
-      format('Cleared request_latch_id %s', r.request_latch_id));
-  END LOOP;
+  UPDATE async.request_latch SET ready = now()
+  WHERE ready IS NULL;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -2078,14 +2409,21 @@ BEGIN
       RETURN;
     END IF;    
 
-    /* wait a little bit before showing message, and be aggressive */      
-    IF _show_message 
+    /* wait a little bit before showing message */      
+    IF _show_message OR g.paused
     THEN
       IF clock_timestamp() - _last_did_stuff > _back_off  
         OR _last_did_stuff IS NULL
       THEN
-        _show_message := false;  
-        PERFORM async.log('Nothing to do. sleeping...');
+        IF g.paused 
+        THEN
+          _last_did_stuff := now(); 
+          _show_message := true;
+          PERFORM async.log('Server paused.');
+        ELSE 
+          _show_message := false;  
+          PERFORM async.log('Nothing to do. sleeping...');
+        END IF;
       END IF;
 
       PERFORM pg_sleep(g.busy_sleep);
@@ -2171,8 +2509,7 @@ BEGIN
     processing_error = 'presumed failed due to async startup'
   WHERE 
     consumed IS NOT NULL
-    AND processed IS NULL
-    AND concurrency_pool IS NOT NULL;
+    AND processed IS NULL;
 
   SET LOCAL enable_seqscan TO DEFAULT;
   SET LOCAL enable_bitmapscan TO DEFAULT;
@@ -2298,7 +2635,7 @@ CREATE OR REPLACE VIEW async.v_server_info AS
       AS uptime,
     last_message,
     CASE 
-      WHEN NOT enabled AND observed_pid IS NULL THEN 'paused'
+      WHEN NOT enabled AND observed_pid IS NULL THEN 'disabled'
       WHEN last_message LIKE 'Initializing asynchronous query processor%'
         THEN format(
           'starting up for %s',
@@ -2307,6 +2644,7 @@ CREATE OR REPLACE VIEW async.v_server_info AS
       WHEN server_pid IS DISTINCT FROM observed_pid 
         AND lock_pid IS NOT NULL THEN 'Not running (locked in console?)'
       WHEN server_pid IS DISTINCT FROM observed_pid THEN 'Not running'
+      WHEN paused THEN 'paused'
       WHEN last_message = 'Performing heavy maintenance'
         THEN format(
           'In heavy maintenance for %s', 
@@ -2355,16 +2693,20 @@ CREATE OR REPLACE VIEW async.v_server_info AS
       c.pid AS server_pid,      
       s.pid AS observed_pid,
       enabled,
+      paused,
       lk.pid AS lock_pid
     FROM async.control c
     LEFT JOIN pg_stat_activity s ON 
       s.query ILIKE '%call async.main(%'
       AND s.pid != pg_backend_pid()
       AND state != 'idle'
+      AND datname = current_database()
     LEFT JOIN pg_locks lk ON 
       locktype = 'advisory'
       AND objid = c.advisory_mutex_id
       AND granted
+      AND database = 
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     LEFT JOIN
     (
       SELECT * FROM async.server_log ORDER BY 1 DESC LIMIT 1
@@ -2493,7 +2835,7 @@ BEGIN
       FROM async.tail_once(_server_log_id, _grep, _limit)
     LOOP
       _found := true;
-      RAISE NOTICE '[%]: %', l.server_log, l.message;
+      RAISE NOTICE '[% - %]: %', l.happened::TIMESTAMPTZ(2), l.server_log, l.message;
 
       _server_log_id := l.server_log;
     END LOOP;
