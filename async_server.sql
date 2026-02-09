@@ -329,7 +329,8 @@ BEGIN
   FROM async.task
   WHERE 
     processed IS NULL
-    AND concurrency_pool IS NOT NULL;
+    AND consumed IS NULL
+    AND yielded IS NULL;
 
   INSERT INTO async.worker SELECT 
     s,
@@ -1568,7 +1569,8 @@ BEGIN
     LOOP
       PERFORM * FROM async.task t WHERE 
         t.processed IS NULL
-        AND t.concurrency_pool IS NOT NULL
+        AND t.consumed is NULL
+        AND t.yielded IS NULL
         AND t.concurrency_pool = cpt.concurrency_pool
       LIMIT 1;
 
