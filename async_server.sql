@@ -116,28 +116,45 @@ CREATE TABLE async.task
   eligible_when TIMESTAMPTZ
 );
 
+CREATE TYPE async.task_execution_state_t AS ENUM
+(
+  'READY',
+  'RUNNING',
+  'YIELDED',
+  'FINISHED'
+);
+
+CREATE OR REPLACE FUNCTION async.task_execution_state(t async.task) 
+  RETURNS async.task_execution_state_t AS
+$$
+  SELECT 
+    CASE 
+      WHEN t.processed IS NOT NULL THEN 'FINISHED'
+      WHEN t.consumed IS NULL AND t.yielded IS NULL THEN 'READY'
+      WHEN t.yielded IS NOT NULL THEN 'YIELDED'
+      WHEN t.consumed IS NOT NULL AND t.yielded IS NULL THEN 'RUNNING'
+    END::async.task_execution_state_t;
+$$ LANGUAGE SQL IMMUTABLE;
+
+
 /* supports fetching eligible tasks */
 CREATE INDEX ON async.task(concurrency_pool, priority, entered) 
-WHERE 
-  consumed IS NULL
-  AND yielded IS NULL
-  AND processed IS NULL;  
+WHERE async.task_execution_state(task) = 'READY';
 
+/* look up expired tasks.  Times up qual is to prevent index being used for
+ * any other purpose.
+ */
 CREATE INDEX ON async.task(times_up)
   WHERE 
-    processed IS NULL
-    /* postgres strangely picks this index when it should not, so force an
-     * unusual qual so that it is ineligible for standard queries
-     */
+    async.task_execution_state(task) IN('READY', 'RUNNING', 'YIELDED')
     AND times_up IS NOT NULL;
 
-/* supports cleaning up dead tasks on startup */
+/* supports cleaning up dead tasks on startup and other needs for 
+ * processing unfinished tasks.
+ */
 CREATE INDEX ON async.task(task_id)
-  WHERE 
-    consumed IS NOT NULL
-    AND processed IS NULL;    
-
-
+  WHERE async.task_execution_state(task) IN('READY', 'RUNNING', 'YIELDED');
+    
 CREATE UNLOGGED TABLE async.worker
 (
   slot INT PRIMARY KEY,
@@ -326,11 +343,9 @@ BEGIN
   DELETE FROM async.concurrency_pool_tracker;
 
   PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
-  FROM async.task
+  FROM async.task t
   WHERE 
-    processed IS NULL
-    AND consumed IS NULL
-    AND yielded IS NULL;
+    async.task_execution_state(t) = 'READY';
 
   INSERT INTO async.worker SELECT 
     s,
@@ -451,9 +466,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
       SELECT * FROM async.task t
       WHERE
         pt.concurrency_pool = t.concurrency_pool
-        AND t.consumed IS NULL
-        AND t.processed IS NULL
-        AND t.yielded IS NULL
+        AND async.task_execution_state(t) = 'READY'
         AND (eligible_when IS NULL OR eligible_when <= now())
       ORDER BY priority, entered
       LIMIT pt.max_workers - pt.workers
@@ -1394,7 +1407,7 @@ BEGIN
     SELECT array_agg(task_id) AS tasks
     FROM async.task t
     WHERE 
-      processed IS NULL
+      async.task_execution_state(t) IN('RUNNING', 'YIELDED')
       AND times_up < now()
   )
   WHERE array_upper(tasks, 1) >= 1;
@@ -1568,9 +1581,7 @@ BEGIN
         )
     LOOP
       PERFORM * FROM async.task t WHERE 
-        t.processed IS NULL
-        AND t.consumed is NULL
-        AND t.yielded IS NULL
+        async.task_execution_state(t) IN ('READY', 'RUNNING', 'YIELDED')
         AND t.concurrency_pool = cpt.concurrency_pool
       LIMIT 1;
 
@@ -1636,10 +1647,9 @@ BEGIN
             error_message TEXT,
             duration INTERVAL)
         ) d                 
-        WHERE t.consumed IS NULL
-        AND t.processed IS NULL
-        AND t.yielded IS NULL
-        AND t.concurrency_pool = (SELECT self_target FROM async.control)
+        WHERE 
+          async.task_execution_state(t) = 'READY'
+          AND t.concurrency_pool = (SELECT self_target FROM async.control)
       ) q
     )
     GROUP BY 2, 3, 4
@@ -1987,13 +1997,11 @@ BEGIN
   SET LOCAL enable_bitmapscan TO false;
 
   PERFORM async.log('Cleaning up unfinished tasks (if any)');
-  UPDATE async.task SET 
+  UPDATE async.task t SET 
     processed = now(),
     failed = true,
     processing_error = 'presumed failed due to async startup'
-  WHERE 
-    consumed IS NOT NULL
-    AND processed IS NULL;
+  WHERE async.task_execution_state(t) IN('RUNNING', 'YIELDED'); 
 
   SET LOCAL enable_seqscan TO DEFAULT;
   SET LOCAL enable_bitmapscan TO DEFAULT;
