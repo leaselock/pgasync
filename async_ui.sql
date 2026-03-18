@@ -1,4 +1,15 @@
 
+DO
+$code$
+BEGIN
+
+BEGIN
+  PERFORM 1 FROM async.control LIMIT 0;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Async server library incorrectly installed';
+  RETURN;
+END;
+
 /* Views and functions to support flow administration from UI */
 
 CREATE OR REPLACE FUNCTION async.interval_pretty(i INTERVAL) RETURNS TEXT AS
@@ -8,7 +19,7 @@ $$
       WHEN d > 0 THEN format('%sd %sh %sm %ss', d, h, m, round(s, 0))
       WHEN h > 0 THEN format('%sh %sm %ss', h, m, round(s, 0))
       WHEN m > 0 THEN format('%sm %ss', m, round(s, 0))
-      WHEN s < 0.0001 THEN format('%ss', round(s, 5))
+      WHEN s < 0.0001 THEN format('%ss', round(s, 1))
       WHEN s < 0.001 THEN format('%ss', round(s, 4))
       WHEN s < 0.01 THEN format('%ss', round(s, 3))
       WHEN s < 0.1 THEN format('%ss', round(s, 2))
@@ -302,3 +313,5 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+END;
+$code$

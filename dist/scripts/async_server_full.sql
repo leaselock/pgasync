@@ -530,6 +530,7 @@ BEGIN
   UPDATE async.client_control SET client_only = false;
 EXCEPTION WHEN undefined_table THEN
   RAISE EXCEPTION 'Please install client library first';
+  RETURN;
 END;
 
 BEGIN
@@ -550,7 +551,7 @@ CREATE TABLE async.control
   advisory_mutex_id INT DEFAULT 0,
 
   self_target TEXT DEFAULT 'async.self', 
-  self_connection_string TEXT DEFAULT 'host=localhost',
+  self_connection_string TEXT DEFAULT NULL,
   self_concurrency INT DEFAULT 4,
 
   last_heavy_maintenance TIMESTAMPTZ,
@@ -634,28 +635,45 @@ CREATE TABLE async.task
   eligible_when TIMESTAMPTZ
 );
 
+CREATE TYPE async.task_execution_state_t AS ENUM
+(
+  'READY',
+  'RUNNING',
+  'YIELDED',
+  'FINISHED'
+);
+
+CREATE OR REPLACE FUNCTION async.task_execution_state(t async.task) 
+  RETURNS async.task_execution_state_t AS
+$$
+  SELECT 
+    CASE 
+      WHEN t.processed IS NOT NULL THEN 'FINISHED'
+      WHEN t.consumed IS NULL AND t.yielded IS NULL THEN 'READY'
+      WHEN t.yielded IS NOT NULL THEN 'YIELDED'
+      WHEN t.consumed IS NOT NULL AND t.yielded IS NULL THEN 'RUNNING'
+    END::async.task_execution_state_t;
+$$ LANGUAGE SQL IMMUTABLE;
+
+
 /* supports fetching eligible tasks */
 CREATE INDEX ON async.task(concurrency_pool, priority, entered) 
-WHERE 
-  consumed IS NULL
-  AND yielded IS NULL
-  AND processed IS NULL;  
+WHERE async.task_execution_state(task) = 'READY';
 
+/* look up expired tasks.  Times up qual is to prevent index being used for
+ * any other purpose.
+ */
 CREATE INDEX ON async.task(times_up)
   WHERE 
-    processed IS NULL
-    /* postgres strangely picks this index when it should not, so force an
-     * unusual qual so that it is ineligible for standard queries
-     */
+    async.task_execution_state(task) IN('READY', 'RUNNING', 'YIELDED')
     AND times_up IS NOT NULL;
 
-/* supports cleaning up dead tasks on startup */
+/* supports cleaning up dead tasks on startup and other needs for 
+ * processing unfinished tasks.
+ */
 CREATE INDEX ON async.task(task_id)
-  WHERE 
-    consumed IS NOT NULL
-    AND processed IS NULL;    
-
-
+  WHERE async.task_execution_state(task) IN('READY', 'RUNNING', 'YIELDED');
+    
 CREATE UNLOGGED TABLE async.worker
 (
   slot INT PRIMARY KEY,
@@ -844,10 +862,9 @@ BEGIN
   DELETE FROM async.concurrency_pool_tracker;
 
   PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
-  FROM async.task
+  FROM async.task t
   WHERE 
-    processed IS NULL
-    AND concurrency_pool IS NOT NULL;
+    async.task_execution_state(t) = 'READY';
 
   INSERT INTO async.worker SELECT 
     s,
@@ -950,6 +967,58 @@ $$
   WHERE task_id IS NOT NULL;
 $$ LANGUAGE SQL STABLE;
 
+/* experimential version of task lookup moved to function in order to install
+ * planner directives.
+ */
+CREATE OR REPLACE FUNCTION async.candidate_tasks(
+  _concurrency_pool TEXT,
+  _limit INT) RETURNS SETOF async.task AS
+$$
+DECLARE 
+  pt RECORD;
+  tt TIMESTAMPTZ;
+  q TEXT;
+BEGIN
+  SET LOCAL enable_bitmapscan TO false;  
+
+  RETURN QUERY SELECT * FROM async.task t
+  WHERE
+    _concurrency_pool = t.concurrency_pool
+    AND async.task_execution_state(t) = 'READY'
+    AND (eligible_when IS NULL OR eligible_when <= now())
+  ORDER BY priority, entered
+  LIMIT _limit;
+
+  SET LOCAL enable_bitmapscan TO true;
+END;
+$$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE VIEW async.v_candidate_task_experimental AS 
+  SELECT * FROM
+  (
+    SELECT 
+      t.*,
+      tg.connection_string,
+      tg.default_timeout,
+      pt.max_workers,
+      pt.workers,
+      0::BIGINT AS n
+    FROM async.concurrency_pool_tracker pt
+    CROSS JOIN async.control
+    CROSS JOIN LATERAL 
+    (
+      SELECT * FROM async.candidate_tasks(
+        pt.concurrency_pool, 
+        pt.max_workers - pt.workers)
+    ) t
+    JOIN async.target tg USING(target)
+    WHERE 
+      pt.workers < pt.max_workers 
+      AND t.target != self_target
+      AND pt.concurrency_pool != self_target
+  ) 
+  ORDER BY priority, entered
+  LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS 
@@ -968,9 +1037,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
       SELECT * FROM async.task t
       WHERE
         pt.concurrency_pool = t.concurrency_pool
-        AND t.consumed IS NULL
-        AND t.processed IS NULL
-        AND t.yielded IS NULL
+        AND async.task_execution_state(t) = 'READY'
         AND (eligible_when IS NULL OR eligible_when <= now())
       ORDER BY priority, entered
       LIMIT pt.max_workers - pt.workers
@@ -984,6 +1051,9 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
   ORDER BY priority, entered
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
+/* experimental version to assing tasks to optimial slot all at once instead
+ * of iterative loop.
+ */
 CREATE OR REPLACE VIEW async.v_task_assigned_worker AS 
   WITH tasks_to_run AS MATERIALIZED
   (
@@ -1911,7 +1981,7 @@ BEGIN
     SELECT array_agg(task_id) AS tasks
     FROM async.task t
     WHERE 
-      processed IS NULL
+      async.task_execution_state(t) IN('RUNNING', 'YIELDED')
       AND times_up < now()
   )
   WHERE array_upper(tasks, 1) >= 1;
@@ -2085,8 +2155,7 @@ BEGIN
         )
     LOOP
       PERFORM * FROM async.task t WHERE 
-        t.processed IS NULL
-        AND t.concurrency_pool IS NOT NULL
+        async.task_execution_state(t) IN ('READY', 'RUNNING', 'YIELDED')
         AND t.concurrency_pool = cpt.concurrency_pool
       LIMIT 1;
 
@@ -2152,10 +2221,9 @@ BEGIN
             error_message TEXT,
             duration INTERVAL)
         ) d                 
-        WHERE t.consumed IS NULL
-        AND t.processed IS NULL
-        AND t.yielded IS NULL
-        AND t.concurrency_pool = (SELECT self_target FROM async.control)
+        WHERE 
+          async.task_execution_state(t) = 'READY'
+          AND t.concurrency_pool = (SELECT self_target FROM async.control)
       ) q
     )
     GROUP BY 2, 3, 4
@@ -2491,6 +2559,21 @@ BEGIN
 
   /* jit can lead to performance problems in main orchestrator loop */
   SET jit = off;
+
+  /* install target to self if needed */
+  INSERT INTO async.target VALUES(
+    g.self_target,
+    g.self_concurrency,
+    COALESCE(
+      g.self_connection_string,
+      format(
+        'host=localhost user=%s dbname=%s',
+        current_user,
+        current_database())),
+    false,
+    NULL,
+    false)
+  ON CONFLICT DO NOTHING;
   
   /* run maintenance now as a precaution */
   CALL async.maintenance(true);
@@ -2503,13 +2586,11 @@ BEGIN
   SET LOCAL enable_bitmapscan TO false;
 
   PERFORM async.log('Cleaning up unfinished tasks (if any)');
-  UPDATE async.task SET 
+  UPDATE async.task t SET 
     processed = now(),
     failed = true,
     processing_error = 'presumed failed due to async startup'
-  WHERE 
-    consumed IS NOT NULL
-    AND processed IS NULL;
+  WHERE async.task_execution_state(t) IN('RUNNING', 'YIELDED'); 
 
   SET LOCAL enable_seqscan TO DEFAULT;
   SET LOCAL enable_bitmapscan TO DEFAULT;
@@ -2549,6 +2630,17 @@ $code$;
 
 
 
+DO
+$code$
+BEGIN
+
+BEGIN
+  PERFORM 1 FROM async.control LIMIT 0;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Async server library incorrectly installed';
+  RETURN;
+END;
+
 /* Views and functions to support flow administration from UI */
 
 CREATE OR REPLACE FUNCTION async.interval_pretty(i INTERVAL) RETURNS TEXT AS
@@ -2558,7 +2650,7 @@ $$
       WHEN d > 0 THEN format('%sd %sh %sm %ss', d, h, m, round(s, 0))
       WHEN h > 0 THEN format('%sh %sm %ss', h, m, round(s, 0))
       WHEN m > 0 THEN format('%sm %ss', m, round(s, 0))
-      WHEN s < 0.0001 THEN format('%ss', round(s, 5))
+      WHEN s < 0.0001 THEN format('%ss', round(s, 1))
       WHEN s < 0.001 THEN format('%ss', round(s, 4))
       WHEN s < 0.01 THEN format('%ss', round(s, 3))
       WHEN s < 0.1 THEN format('%ss', round(s, 2))
@@ -2852,3 +2944,5 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+END;
+$code$

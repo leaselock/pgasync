@@ -12,6 +12,7 @@ BEGIN
   UPDATE async.client_control SET client_only = false;
 EXCEPTION WHEN undefined_table THEN
   RAISE EXCEPTION 'Please install client library first';
+  RETURN;
 END;
 
 BEGIN
@@ -32,7 +33,7 @@ CREATE TABLE async.control
   advisory_mutex_id INT DEFAULT 0,
 
   self_target TEXT DEFAULT 'async.self', 
-  self_connection_string TEXT DEFAULT 'host=localhost',
+  self_connection_string TEXT DEFAULT NULL,
   self_concurrency INT DEFAULT 4,
 
   last_heavy_maintenance TIMESTAMPTZ,
@@ -448,6 +449,58 @@ $$
   WHERE task_id IS NOT NULL;
 $$ LANGUAGE SQL STABLE;
 
+/* experimential version of task lookup moved to function in order to install
+ * planner directives.
+ */
+CREATE OR REPLACE FUNCTION async.candidate_tasks(
+  _concurrency_pool TEXT,
+  _limit INT) RETURNS SETOF async.task AS
+$$
+DECLARE 
+  pt RECORD;
+  tt TIMESTAMPTZ;
+  q TEXT;
+BEGIN
+  SET LOCAL enable_bitmapscan TO false;  
+
+  RETURN QUERY SELECT * FROM async.task t
+  WHERE
+    _concurrency_pool = t.concurrency_pool
+    AND async.task_execution_state(t) = 'READY'
+    AND (eligible_when IS NULL OR eligible_when <= now())
+  ORDER BY priority, entered
+  LIMIT _limit;
+
+  SET LOCAL enable_bitmapscan TO true;
+END;
+$$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE VIEW async.v_candidate_task_experimental AS 
+  SELECT * FROM
+  (
+    SELECT 
+      t.*,
+      tg.connection_string,
+      tg.default_timeout,
+      pt.max_workers,
+      pt.workers,
+      0::BIGINT AS n
+    FROM async.concurrency_pool_tracker pt
+    CROSS JOIN async.control
+    CROSS JOIN LATERAL 
+    (
+      SELECT * FROM async.candidate_tasks(
+        pt.concurrency_pool, 
+        pt.max_workers - pt.workers)
+    ) t
+    JOIN async.target tg USING(target)
+    WHERE 
+      pt.workers < pt.max_workers 
+      AND t.target != self_target
+      AND pt.concurrency_pool != self_target
+  ) 
+  ORDER BY priority, entered
+  LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
 
 CREATE OR REPLACE VIEW async.v_candidate_task AS 
@@ -480,6 +533,9 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
   ORDER BY priority, entered
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
+/* experimental version to assing tasks to optimial slot all at once instead
+ * of iterative loop.
+ */
 CREATE OR REPLACE VIEW async.v_task_assigned_worker AS 
   WITH tasks_to_run AS MATERIALIZED
   (
@@ -1985,6 +2041,21 @@ BEGIN
 
   /* jit can lead to performance problems in main orchestrator loop */
   SET jit = off;
+
+  /* install target to self if needed */
+  INSERT INTO async.target VALUES(
+    g.self_target,
+    g.self_concurrency,
+    COALESCE(
+      g.self_connection_string,
+      format(
+        'host=localhost user=%s dbname=%s',
+        current_user,
+        current_database())),
+    false,
+    NULL,
+    false)
+  ON CONFLICT DO NOTHING;
   
   /* run maintenance now as a precaution */
   CALL async.maintenance(true);
