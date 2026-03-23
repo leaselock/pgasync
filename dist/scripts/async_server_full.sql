@@ -2945,4 +2945,5 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 END;
-$code$
+$code$;
+
