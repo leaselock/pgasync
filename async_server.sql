@@ -626,13 +626,13 @@ CREATE OR REPLACE VIEW async.v_task_assigned_worker AS
   (
     SELECT 
       t.*,
-      row_number() OVER (
-        PARTITION BY t.target) idx2
+      row_number() OVER () idx2
     FROM tasks_to_run t
-    LEFT JOIN matched_target mt USING (task_id)
+    LEFT JOIN matched_target mt USING(task_id)
+    LEFT JOIN remain_workers rw USING (idx2)
     WHERE 
       mt.task_id IS NULL
-      AND t.query IS NOT NULL
+      AND t.query IS NOT NULL  
   )
   SELECT mt.* 
   FROM matched_target mt
@@ -789,7 +789,7 @@ BEGIN
           PERFORM async.log(
             'WARNING',
             format(
-              'When attempting to run task: %s in slot: %s '
+              'When testing connection for task: %s in slot: %s '
               'for connection: %s, got %s', 
               r.task_id,
               r.slot,
@@ -863,7 +863,11 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
       PERFORM async.log(
         'WARNING',
-        format('Got %s when attempting to run task %s', SQLERRM, r.task_id));
+        format(
+          'Got %s when attempting to run task %s in slot %s', 
+          SQLERRM, 
+          r.task_id,
+          r.slot));
 
       UPDATE async.task SET 
         consumed = clock_timestamp(),
@@ -1388,7 +1392,6 @@ DECLARE
   _reap_task_ids BIGINT[];
   _did_stuff BOOL DEFAULT false;
 BEGIN
-
   PERFORM async.finish_internal(
     tasks,
     'FAILED'::async.finish_status_t,
@@ -1762,6 +1765,9 @@ DECLARE
   _did_reap BOOL;
 
   _tasks_run INT;
+
+  _context TEXT;
+  _message TEXT;
 BEGIN
 
   IF _print_stats
@@ -1824,7 +1830,14 @@ BEGIN
 
 EXCEPTION
   WHEN OTHERS THEN 
-    PERFORM async.log('ERROR', format('Unexpected error %s', SQLERRM));
+    GET STACKED DIAGNOSTICS 
+      _context = PG_EXCEPTION_CONTEXT,
+      _message = MESSAGE_TEXT;
+
+    PERFORM async.log('ERROR', 
+      format(E'Unhandled error: %s context: %s', 
+        _message,
+        _context));
 END;  
 $$ LANGUAGE PLPGSQL;
 
@@ -1959,7 +1972,7 @@ $$ LANGUAGE PLPGSQL;
 CREATE OR REPLACE PROCEDURE async.cycle(
   _last_did_stuff INOUT TIMESTAMPTZ DEFAULT NULL,
   _show_message INOUT BOOL DEFAULT NULL,
-  _last_printed_stats INOUT TIMESTAMPTZ DEFAULT now(),
+  _last_printed_stats INOUT TIMESTAMPTZ DEFAULT '01/01/2000'::TIMESTAMPTZ,
   _exit INOUT BOOL DEFAULT false) AS
 $$
 DECLARE
