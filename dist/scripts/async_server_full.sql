@@ -873,10 +873,14 @@ BEGIN
 
   FOR t IN SELECT * FROM async.target
   LOOP
-    PERFORM async.log('DEBUG', 'Testing target ' || t.target);
-    PERFORM * FROM dblink(
-      (SELECT t.connection_string),
-      'SELECT 0') AS R(V INT);
+    BEGIN
+      PERFORM async.log('DEBUG', 'Testing target ' || t.target);
+      PERFORM * FROM dblink(
+        (SELECT t.connection_string),
+        'SELECT 0') AS R(V INT);
+    EXCEPTION WHEN OTHERS THEN
+      PERFORM async.log('WARNING', 'Unable to connect to ' || t.target);
+    END;
   END LOOP;
 
 END;
