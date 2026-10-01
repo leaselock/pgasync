@@ -150,7 +150,9 @@ CREATE UNIQUE INDEX ON async.task_complete(task_id);
 
 /* supports fetching eligible tasks */
 CREATE INDEX ON async.task_running(concurrency_pool, priority, entered) 
-WHERE async.task_execution_state(task_running) = 'READY';
+WHERE 
+  async.task_execution_state(task_running) = 'READY'
+  AND COALESCE(source, '') != 'async.finish';
 
 /* supports fetching queued non-query tasks */
 CREATE INDEX ON async.task_running(concurrency_pool, priority, entered) 
@@ -165,6 +167,12 @@ CREATE INDEX ON async.task_running(times_up)
   WHERE 
     async.task_execution_state(task_running) IN('READY', 'RUNNING', 'YIELDED')
     AND times_up IS NOT NULL;
+
+
+CREATE INDEX ON async.task_running(source)
+  WHERE 
+    async.task_execution_state(task_running) = 'READY'
+    AND source IN ('async.finish', 'async.internal_query');
     
 CREATE UNLOGGED TABLE async.worker
 (
@@ -255,6 +263,31 @@ CREATE OR REPLACE TRIGGER on_async_control_update
   FOR EACH ROW WHEN (new.debug_log IS DISTINCT FROM old.debug_log)
   EXECUTE PROCEDURE async.replan();
 
+CREATE OR REPLACE FUNCTION async.timer(
+  _event TEXT DEFAULT NULL,
+  _state INOUT JSONB DEFAULT NULL) RETURNS JSONB AS
+$$
+  SELECT 
+    CASE WHEN NOT (_event IS NOT NULL AND _state IS NULL)
+      THEN COALESCE(CASE WHEN _event IS NOT NULL THEN _state END::JSONB, '[]') 
+        || jsonb_build_object(
+      'event', COALESCE(_event, 'initialized'),
+      'happened', clock_timestamp())
+    END;
+$$ LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION async.format_timing(i INTERVAL) RETURNS TEXT AS
+$$
+  SELECT 
+    CASE WHEN e > 9999999
+      THEN '*******'
+      ELSE lpad(e::TEXT, 7)
+    END
+  FROM 
+  (
+    SELECT (extract('epoch' FROM i) * 1000000)::BIGINT e
+  );
+$$ LANGUAGE SQL IMMUTABLE;
 
 
 CREATE OR REPLACE FUNCTION async.log(
@@ -301,6 +334,27 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+
+CREATE OR REPLACE FUNCTION async.log_timer(
+  _state JSONB,
+  _prefix TEXT) RETURNS TEXT AS
+$$
+  SELECT 
+    async.log(_prefix || 'timing (us) ' || COALESCE(string_agg(
+      format(
+        '%s: %s', 
+        e->>'event', 
+        async.format_timing(i)),
+      ' ') FILTER (WHERE n > 1), ''))
+  FROM
+  (
+    SELECT 
+      *,
+      (e->>'happened')::TIMESTAMPTZ 
+        - lag((e->>'happened')::TIMESTAMPTZ) OVER (ORDER BY n) i
+    FROM jsonb_array_elements(_state) WITH ORDINALITY AS R(e, n)
+  )
+$$ LANGUAGE SQL;
 
 
 CREATE OR REPLACE VIEW async.v_target AS 
@@ -519,6 +573,7 @@ BEGIN
     _concurrency_pool = t.concurrency_pool
     AND async.task_execution_state(t) = 'READY'
     AND (eligible_when IS NULL OR eligible_when <= now())
+    AND COALESCE(source, '') != 'async.finish'
   ORDER BY priority, entered
   LIMIT _limit;
 
@@ -572,6 +627,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
         pt.concurrency_pool = t.concurrency_pool
         AND async.task_execution_state(t) = 'READY'
         AND (eligible_when IS NULL OR eligible_when <= now())
+        AND COALESCE(source, '') != 'async.finish'
       ORDER BY priority, entered
       LIMIT pt.max_workers - pt.workers
     ) t 
@@ -753,7 +809,9 @@ $$ LANGUAGE PLPGSQL;
 
 
 /* optimized version to consolidate queries reading and writing */
-CREATE OR REPLACE FUNCTION async.run_tasks(did_stuff OUT BOOL) RETURNS BOOL AS
+CREATE OR REPLACE FUNCTION async.run_tasks(
+  timer INOUT JSONB DEFAULT NULL, 
+  did_stuff OUT BOOL) RETURNS RECORD AS
 $$
 DECLARE
   r RECORD;
@@ -763,6 +821,8 @@ DECLARE
 
   _tasks_ran JSONB DEFAULT '[]'::JSONB;
   _test_connection BOOL DEFAULT false;
+
+  _first BOOL DEFAULT true;
 BEGIN 
   did_stuff := false;
 
@@ -770,6 +830,12 @@ BEGIN
 
   FOR r IN SELECT * FROM async.v_task_assigned_worker
   LOOP
+    IF _first 
+    THEN
+      timer := async.timer('asn', timer);
+      _first := false;
+    END IF;
+
     BEGIN
       PERFORM async.log(
         'DEBUG',
@@ -887,6 +953,13 @@ BEGIN
     did_stuff := true;
   END LOOP;
 
+  IF _first 
+  THEN
+    timer := async.timer('asn', timer);
+  END IF;
+
+  timer := async.timer('alr',timer);
+
   IF did_stuff
   THEN
     WITH tasks_ran AS
@@ -934,6 +1007,8 @@ BEGIN
     ) q
     WHERE cpt.concurrency_pool = q.concurrency_pool;         
   END IF;
+
+  timer := async.timer('trk', timer);
 END; 
 $$ LANGUAGE PLPGSQL;
 
@@ -1087,6 +1162,22 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE VIEW async.v_finish_task AS
+  SELECT 
+    w.slot, 
+    w.name, 
+    t.task_id, 
+    t.asynchronous_finish,
+    t.processed IS NOT NULL AS already_finished,
+    t.finish_status = 'CANCELED' AS canceled,
+    d.name IS NOT NULL AS has_connection
+  FROM async.task_running t
+  LEFT JOIN async.worker w USING(task_id)
+  LEFT JOIN
+  (
+    SELECT unnest(dblink_get_connections()) name
+  ) d USING(name);
+
 /* 
  * Sets complete and release worker with attached connection (if any).  If
  * the connection is active, the query will be cancelled and additionally 
@@ -1104,7 +1195,8 @@ CREATE OR REPLACE FUNCTION async.finish_internal(
   _status async.finish_status_t,
   _context TEXT,
   _error_message TEXT,
-  _duration INTERVAL) RETURNS VOID AS
+  _duration INTERVAL,
+  _timer INOUT JSONB DEFAULT NULL) RETURNS JSONB AS
 $$
 DECLARE
   _finish_time TIMESTAMPTZ DEFAULT clock_timestamp();
@@ -1115,6 +1207,7 @@ DECLARE
   _reap_error_message TEXT;
   _failed BOOL;
   _reaping BOOL;
+  _first BOOL DEFAULT TRUE;
 
   _reaping_status JSONB DEFAULT '[]'::JSONB;
 BEGIN 
@@ -1146,40 +1239,14 @@ BEGIN
    * Note, reap_tasks checks query 'is_busy', but there are other paths into 
    * this code (for example cancelling) so we double check.
    */
-  FOR r IN 
-    SELECT 
-      w.slot, 
-      w.name, 
-      q.task_id, 
-      t.task_id IS NOT NULL AS valid_task,
-      t.asynchronous_finish,
-      t.processed IS NOT NULL AS already_finished,
-      t.finish_status = 'CANCELED' AS canceled,
-      d.name IS NOT NULL AS has_connection
-    FROM
-    (
-      SELECT unnest(_task_ids) task_id
-    ) q
-    LEFT JOIN async.task_running t USING(task_id)
-    LEFT JOIN async.worker w USING(task_id)
-    LEFT JOIN
-    (
-      SELECT unnest(dblink_get_connections()) name
-    ) d USING(name)
+  FOR r IN SELECT * FROM async.v_finish_task WHERE task_id = ANY(_task_ids)
   LOOP
-    IF NOT r.valid_task
-    THEN
-      PERFORM async.log(
-        'WARNING',
-        format(
-          'Attempting to finish invalid task ids {%s} via %s with status, "%s"%s',   
-          r.task_id,
-          _context,
-          COALESCE(_status::TEXT, '(reaping)'),
-          COALESCE(' via: ' || _error_message, '')));
-
-      CONTINUE;
-    ELSIF r.already_finished
+    IF _first = true
+    THEN  
+      _timer := async.timer('fit', _timer);
+      _first := false;
+    END IF;
+    IF r.already_finished
     THEN
       PERFORM async.log(
         'WARNING',
@@ -1212,9 +1279,11 @@ BEGIN
     IF r.has_connection AND _status IS DISTINCT FROM 'CANCELED'
     THEN
       BEGIN
+        SET LOCAL client_min_messages = 'WARNING';
         PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
         _reap_error_message := dblink_error_message(r.name);
         PERFORM * FROM dblink_get_result(r.name) AS R(v TEXT);
+        SET LOCAL client_min_messages = default;
       EXCEPTION WHEN OTHERS THEN
         _reap_error_message := SQLERRM;
       END;
@@ -1256,7 +1325,7 @@ BEGIN
     /* assume we don't have to disconnect if the executed task returns 
      * normally.
      */
-    _disconnect := _status NOT IN('FINISHED', 'YIELDED', 'DEFERRED');
+    _disconnect := _status NOT IN('FINISHED', 'YIELDED', 'DEFERRED', 'FAILED');
 
     /* dblink can raise spurious erorrs during various network induced edge 
      * cases...if so capture them and blend message into the task error.  
@@ -1288,11 +1357,15 @@ BEGIN
     END IF;
   END LOOP;
 
+  _timer := async.timer('fi2', _timer);
+
   /* clear worker.  if connection is kept, target will be left alone */
   UPDATE async.worker SET 
     task_id = NULL,
     running_since = NULL
   WHERE task_id = ANY(_task_ids);   
+
+  _timer := async.timer('fi3', _timer);
 
   /* mark task complete! */
   WITH data AS
@@ -1332,7 +1405,9 @@ BEGIN
         FROM jsonb_array_elements(_reaping_status) j 
       ) reap USING(task_id)
     ) q
-    WHERE t.task_id = q.task_id
+    WHERE 
+      t.task_id = q.task_id
+      AND processed IS NULL
     RETURNING *
   )
   /* manage concurrency pool thread count. If finished, it will bet set false,
@@ -1363,6 +1438,7 @@ BEGIN
   ) q
   WHERE p.concurrency_pool = q.concurrency_pool;
 
+  _timer := async.timer('fi4', _timer);
   /* untrack deferred and yielded tasks set not to be tacked.  It's tricky
    * to do this without UPDATE RETURNING old/new, in the same statement that 
    * does the main update in a way that allows for updating the concurrency 
@@ -1379,60 +1455,79 @@ BEGIN
       )
       OR finish_status = 'DEFERRED'
     );
+
+
+  _timer := async.timer('fi5', _timer);
+
 END;
 $$ LANGUAGE PLPGSQL;
 
+
+/* Which tasks are done? Will only work from the server process hosting the
+ * connections.
+ */
+CREATE OR REPLACE VIEW async.v_ready_to_reap AS
+  SELECT t.task_id
+  FROM async.worker w 
+  LEFT JOIN async.task_running t USING(task_id)
+  WHERE 
+    w.task_id IS NOT NULL
+    AND name = any(dblink_get_connections())
+    AND dblink_is_busy(w.name) != 1;
 
 
 
 
 /* Update task to completion state based on query resolving in background. */
-CREATE OR REPLACE FUNCTION async.reap_tasks() RETURNS BOOL AS 
+CREATE OR REPLACE FUNCTION async.reap_tasks(
+  timer INOUT JSONB DEFAULT NULL,
+  did_stuff OUT BOOL) RETURNS RECORD AS 
 $$
 DECLARE
   r RECORD;
   _error_message TEXT;
   _failed BOOL;
-  _reap_task_ids BIGINT[];
-  _did_stuff BOOL DEFAULT false;
+  _task_ids BIGINT[];
 BEGIN
+  SELECT INTO _task_ids array_agg(task_id) 
+  FROM async.task_running t
+  WHERE 
+    async.task_execution_state(t) IN('RUNNING', 'YIELDED', 'READY')
+    AND times_up < now();
+
+  timer := async.timer('tmo', timer);
+
   PERFORM async.finish_internal(
-    tasks,
-    'FAILED'::async.finish_status_t,
+    _task_ids,
+    'CANCELED'::async.finish_status_t,
     'time out tasks',
     'Canceling due to time out',
     NULL::INTERVAL)
-  FROM
-  (
-    SELECT array_agg(task_id) AS tasks
-    FROM async.task_running t
-    WHERE 
-      async.task_execution_state(t) IN('RUNNING', 'YIELDED')
-      AND times_up < now()
-  )
-  WHERE array_upper(tasks, 1) >= 1;
+  WHERE array_upper(_task_ids, 1) >= 1;
 
-  _did_stuff := FOUND;
+  timer := async.timer('cnl', timer);
 
-  PERFORM async.finish_internal(
-    task_ids,
-    NULL::async.finish_status_t,
-    'async.reap_tasks',
-    NULL,
-    NULL::INTERVAL)
-  FROM
-  (
-    SELECT array_agg(t.task_id) AS task_ids
-    FROM async.worker w 
-    LEFT JOIN async.task_running t USING(task_id)
-    WHERE 
-      w.task_id IS NOT NULL
-      AND name = any(dblink_get_connections())
-      AND dblink_is_busy(w.name) != 1
-  ) q
-  WHERE array_upper(task_ids, 1) >= 1;
+  SELECT INTO _task_ids array_agg(task_id) 
+  FROM async.v_ready_to_reap;
 
-  RETURN _did_stuff OR FOUND;
+  timer := async.timer('rp', timer);
+
+  IF  array_upper(_task_ids, 1) >= 1
+  THEN
+    SELECT INTO timer *
+    FROM async.finish_internal(
+      _task_ids,
+      NULL::async.finish_status_t,
+      'async.reap_tasks',
+      NULL,
+      NULL::INTERVAL,
+      timer);
+
+    did_stuff := TRUE;
+  ELSE 
+    did_stuff := FALSE;
+  END IF;
+
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -1674,19 +1769,31 @@ CREATE OR REPLACE VIEW async.v_internal_query AS
     AND source = 'async.internal_query';
 
 
-CREATE OR REPLACE FUNCTION async.run_internal() RETURNS BOOL AS
+CREATE OR REPLACE FUNCTION async.run_internal(
+  timer INOUT JSONB DEFAULT NULL,
+  did_stuff OUT BOOL) RETURNS RECORD AS 
 $$
 DECLARE
   r RECORD;
-  _did_stuff BOOL DEFAULT false;
+  _first BOOL DEFAULT true;
 BEGIN
+  did_stuff := false;
+
   /* optimized path for bulk task finish */
   FOR r IN SELECT * FROM async.v_run_internal
   LOOP
+    IF _first
+    THEN
+      timer := async.timer('in1', timer);
+      _first := false;
+    END IF;
+
     UPDATE async.task SET 
       consumed = now(),
       processed = now()
-    WHERE task_id = any(r.deferred_task_ids);
+    WHERE 
+      task_id = any(r.deferred_task_ids)
+      AND processed IS NULL;
 
     PERFORM async.finish_internal(
       r.task_ids, 
@@ -1695,8 +1802,17 @@ BEGIN
       r.error_message,
       r.duration::INTERVAL);
 
-    _did_stuff := true;
+    did_stuff := true;
   END LOOP;
+
+  IF _first
+  THEN
+    timer := async.timer('in1', timer);
+  ELSE
+    _first := true;
+  END IF;  
+
+  timer := async.timer('in2', timer);
 
   FOR r IN SELECT * FROM async.v_internal_query
   LOOP
@@ -1725,26 +1841,15 @@ BEGIN
       processed = now()
     WHERE task_id = r.task_id;
 
-    _did_stuff := true;
+    did_stuff := true;
   END LOOP;
 
+  timer := async.timer('in3', timer);
+
   /* XXX: handle non finished tasks (with partial index supporting) */
-  RETURN _did_stuff;
 END;
 $$ LANGUAGE PLPGSQL;
 
-CREATE OR REPLACE FUNCTION async.format_timing(i INTERVAL) RETURNS TEXT AS
-$$
-  SELECT 
-    CASE WHEN e > 99999999
-      THEN '********'
-      ELSE lpad(e::TEXT, 8)
-    END
-  FROM 
-  (
-    SELECT (extract('epoch' FROM i) * 1000000)::BIGINT e
-  );
-$$ LANGUAGE SQL IMMUTABLE;
 
 CREATE OR REPLACE PROCEDURE async.do_work(
   did_work INOUT BOOL,
@@ -1753,17 +1858,8 @@ CREATE OR REPLACE PROCEDURE async.do_work(
   _idle BOOL) AS
 $$
 DECLARE
-  _when TIMESTAMPTZ;
-  _work_start TIMESTAMPTZ;
-  _reap_time INTERVAL;
-  _internal_time INTERVAL;
-  _routine_time INTERVAL;
-  _since_commit INTERVAL;
-  _total_time INTERVAL;
-  _finish_time TIMESTAMPTZ;
-  _commit_start TIMESTAMPTZ;
+  _timer JSONB;
 
-  _run_time INTERVAL;
   _did_internal BOOL;
   _did_run BOOL;
   _did_reap BOOL;
@@ -1772,56 +1868,40 @@ DECLARE
 
   _context TEXT;
   _message TEXT;
-BEGIN
 
+BEGIN
   IF _print_stats
   THEN
-    _commit_start := now();
-    _when := clock_timestamp();
-    _work_start := _when;
+    _timer := async.timer();
 
-    _when := clock_timestamp();
-    _did_internal := async.run_internal();
-    _internal_time := clock_timestamp() - _when;
+    SELECT INTO _did_internal, _timer did_stuff, timer 
+    FROM async.run_internal(_timer);    
 
-    _when := clock_timestamp();
-    _did_reap := async.reap_tasks();
-    _reap_time := clock_timestamp() - _when;    
+    SELECT INTO _did_reap, _timer did_stuff, timer 
+    FROM async.reap_tasks(_timer);
 
-    _when := clock_timestamp();
-    _did_run := async.run_tasks();
-    _run_time := clock_timestamp() - _when;
+    SELECT INTO _did_run, _timer did_stuff, timer 
+    FROM async.run_tasks(_timer);
 
-    _when := clock_timestamp();
     CALL async.run_routines('LOOP');
-    _finish_time := clock_timestamp();
-    _routine_time := _finish_time - _when;
-
-    _total_time := _finish_time - _work_start;
-    _since_commit := _finish_time - _commit_start;    
+    _timer := async.timer('rt', _timer);
 
     SELECT INTO _tasks_run last_value - CASE WHEN is_called THEN 0 ELSE 1 END
     FROM task_counter;
 
     IF _tasks_run > 0 OR did_work
     THEN
-      PERFORM async.log(
+      PERFORM async.log_timer(
+        _timer, 
         format(
-          'tasks/sec: %s timing (us) total: %s non work: %s reap: %s internal: %s run: %s routine: %s', 
-          lpad(((_tasks_run / NULLIF(_print_stats_period, 0))::INT)::TEXT, 6),
-          async.format_timing(_total_time),
-          async.format_timing((_finish_time - _commit_start) - _total_time),
-          async.format_timing(_reap_time), 
-          async.format_timing(_internal_time), 
-          async.format_timing(_run_time), 
-          async.format_timing(_routine_time)));
-
+          'tasks/sec: %s ', 
+          lpad(((_tasks_run / NULLIF(_print_stats_period, 0))::INT)::TEXT, 6)));
       PERFORM setval('task_counter', 1, false);
     END IF;
   ELSE
-    _did_internal := async.run_internal();
-    _did_reap := async.reap_tasks();
-    _did_run := async.run_tasks();
+    _did_internal :=  (async.run_internal()).did_stuff;
+    _did_reap := (async.reap_tasks()).did_stuff;
+    _did_run := (async.run_tasks()).did_stuff;
     CALL async.run_routines('LOOP');  
   END IF;
 
