@@ -2228,7 +2228,7 @@ BEGIN
   /* jit can lead to performance problems in main orchestrator loop */
   SET jit = off;
 
-  /* install target to self if needed */
+  /* install internal target to self for running queries passed through task */
   INSERT INTO async.target VALUES(
     g.self_target,
     g.self_concurrency,
@@ -2242,6 +2242,21 @@ BEGIN
     NULL,
     false)
   ON CONFLICT DO NOTHING;
+
+  /* create special SELF target for tasks pushed to orchestrator from self  */
+  INSERT INTO async.target VALUES(
+   'SELF',
+    g.self_concurrency,
+    COALESCE(
+      g.self_connection_string,
+      format(
+        'host=localhost user=%s dbname=%s',
+        current_user,
+        current_database())),
+    false,
+    NULL,
+    false)
+  ON CONFLICT DO NOTHING;  
 
   PERFORM async.log('Testing connections');
   PERFORM async.test_connections();
