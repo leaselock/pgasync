@@ -292,7 +292,7 @@ CREATE OR REPLACE FUNCTION async.push_tasks(
   _run_type async.task_run_type_t DEFAULT 'EXECUTE',
   _source TEXT DEFAULT NULL) RETURNS SETOF BIGINT AS
 $$
-DECLARE 
+DECLARE
   _debug BOOL DEFAULT false;
   _tasks_out BIGINT[];
   _pools_out TEXT[];
@@ -300,7 +300,7 @@ BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
     RETURN QUERY SELECT * FROM dblink(
-      async.server(), 
+      async.server(),
       format(
         'SELECT * FROM async.push_tasks(%s, %s, %s)',
         quote_literal($1),
@@ -308,7 +308,7 @@ BEGIN
         quote_nullable($3))) AS R(V BIGINT);
 
     RETURN;
-  END IF; 
+  END IF;
 
   IF _debug
   THEN
@@ -317,14 +317,14 @@ BEGIN
       _run_type,
       _source;
   END IF;
-  
-  WITH data AS  
+
+  WITH data AS
   (
     INSERT INTO async.task(
-      task_data, 
-      target, 
-      priority, 
-      query, 
+      task_data,
+      target,
+      priority,
+      query,
       asynchronous_finish,
       failed,
       finish_status,
@@ -334,19 +334,19 @@ BEGIN
       concurrency_pool,
       manual_timeout,
       track_yielded)
-    SELECT 
+    SELECT
       q.task_data,
       q.target,
       COALESCE(q.priority, 0),
       q.query,
       t.asynchronous_finish AND _run_type NOT IN('EXECUTE_NOASYNC', 'EMPTY'),
-      CASE 
+      CASE
         WHEN _run_type = 'DOA' THEN true
-        WHEN _run_type = 'EMPTY' THEN false 
+        WHEN _run_type = 'EMPTY' THEN false
       END,
-      CASE 
+      CASE
         WHEN _run_type = 'DOA' THEN 'DOA'
-        WHEN _run_type = 'EMPTY' THEN 'FINISHED' 
+        WHEN _run_type = 'EMPTY' THEN 'FINISHED'
       END::async.finish_status_t,
       CASE WHEN _run_type IN('DOA', 'EMPTY') THEN clock_timestamp() END,
       CASE WHEN _run_type IN('DOA', 'EMPTY') THEN clock_timestamp() END,
@@ -354,16 +354,17 @@ BEGIN
       COALESCE(q.concurrency_pool, t.target),
       q.manual_timeout,
       COALESCE(q.track_yielded, t.concurrency_track_yielded, true)
-    FROM 
+    FROM
     (
-      SELECT * 
-      FROM unnest(_tasks)
+      SELECT *
+      FROM unnest(_tasks) WITH ORDINALITY
     ) q
     JOIN async.target t USING(target)
+    ORDER BY ordinality
     RETURNING *
-  ) 
-  SELECT INTO 
-    _tasks_out, 
+  )
+  SELECT INTO
+    _tasks_out,
     _pools_out
     array_agg(d.task_id),
     array_agg(DISTINCT concurrency_pool) FILTER (WHERE processed IS NULL)
@@ -377,7 +378,7 @@ BEGIN
   END IF;
 
   RETURN QUERY SELECT * FROM unnest(_tasks_out);
-  
+
 END;
 $$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
